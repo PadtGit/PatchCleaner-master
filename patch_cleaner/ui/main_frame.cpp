@@ -38,7 +38,6 @@ typedef std::map<std::wstring, uint64_t, StringLessIgnoreCase> FileSizeMap;
 
 constexpr wchar_t kAllUsersSid[] = L"s-1-1-0";
 constexpr wchar_t kTempMoveDirectory[] = L"C:\\TempPatchCleanerFiles";
-constexpr auto kMaxConsecutiveEnumerationErrors = 16;
 
 const wchar_t* GetQuerySid(MSIINSTALLCONTEXT context,
                            const std::wstring& user_sid) {
@@ -211,8 +210,7 @@ std::wstring BuildUniqueMovePath(const std::wstring& source_path) {
   }
 }
 
-void RemoveInstalledPackages(FileSizeMap* files) {
-  auto consecutive_errors = 0;
+bool RemoveInstalledPackages(FileSizeMap* files) {
   for (DWORD index = 0;; ++index) {
     wchar_t product_code[39]{};
     MSIINSTALLCONTEXT context = MSIINSTALLCONTEXT_NONE;
@@ -229,28 +227,27 @@ void RemoveInstalledPackages(FileSizeMap* files) {
     }
 
     if (error != ERROR_SUCCESS) {
-      if (++consecutive_errors >= kMaxConsecutiveEnumerationErrors) {
-        break;
-      }
-      continue;
+      return false;
     }
 
-    consecutive_errors = 0;
     std::wstring local_package;
-    if (QueryInstallerString(
+    if (!QueryInstallerString(
             [&](wchar_t* buffer, DWORD* length) {
               return MsiGetProductInfoEx(
                   product_code, GetQuerySid(context, user_sid), context,
                   INSTALLPROPERTY_LOCALPACKAGE, buffer, length);
             },
             &local_package)) {
-      files->erase(local_package);
+      return false;
     }
+
+    files->erase(local_package);
   }
+
+  return true;
 }
 
-void RemoveInstalledPatches(FileSizeMap* files) {
-  auto consecutive_errors = 0;
+bool RemoveInstalledPatches(FileSizeMap* files) {
   for (DWORD index = 0;; ++index) {
     wchar_t patch_code[39]{};
     wchar_t product_code[39]{};
@@ -269,24 +266,24 @@ void RemoveInstalledPatches(FileSizeMap* files) {
     }
 
     if (error != ERROR_SUCCESS) {
-      if (++consecutive_errors >= kMaxConsecutiveEnumerationErrors) {
-        break;
-      }
-      continue;
+      return false;
     }
 
-    consecutive_errors = 0;
     std::wstring local_package;
-    if (QueryInstallerString(
+    if (!QueryInstallerString(
             [&](wchar_t* buffer, DWORD* length) {
               return MsiGetPatchInfoEx(
                   patch_code, product_code, GetQuerySid(context, user_sid),
                   context, INSTALLPROPERTY_LOCALPACKAGE, buffer, length);
             },
             &local_package)) {
-      files->erase(local_package);
+      return false;
     }
+
+    files->erase(local_package);
   }
+
+  return true;
 }
 
 }  // namespace
@@ -450,8 +447,11 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
   FileSizeMap files;
   EnumFiles(cache_path, L"*.msi", &files);
   EnumFiles(cache_path, L"*.msp", &files);
-  RemoveInstalledPackages(&files);
-  RemoveInstalledPatches(&files);
+  const auto scan_complete =
+      RemoveInstalledPackages(&files) && RemoveInstalledPatches(&files);
+  if (!scan_complete) {
+    files.clear();
+  }
 
   file_list_.SetRedraw(FALSE);
   file_list_.DeleteAllItems();
@@ -491,6 +491,13 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
   file_list_.SetRedraw(TRUE);
   file_list_.RedrawWindow(
       NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+
+  if (!scan_complete) {
+    MessageBox(
+        L"Patch Cleaner could not complete the installer scan safely, so no "
+        L"files were listed.",
+        L"Patch Cleaner", MB_ICONERROR | MB_OK);
+  }
 }
 
 void MainFrame::OnEditSelectAll(UINT /*notify_code*/, int /*id*/,
