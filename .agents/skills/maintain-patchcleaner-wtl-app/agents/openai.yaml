@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain PatchCleaner WTL App"
+  short_description: "PatchCleaner C++/WTL maintenance helper"
+  default_prompt: "Use $maintain-patchcleaner-wtl-app to maintain or review PatchCleaner source, project config, and repo playbook notes."
