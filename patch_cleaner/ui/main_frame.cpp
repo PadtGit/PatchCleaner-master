@@ -38,6 +38,7 @@ typedef std::map<std::wstring, uint64_t, StringLessIgnoreCase> FileSizeMap;
 
 constexpr wchar_t kAllUsersSid[] = L"s-1-1-0";
 constexpr wchar_t kTempMoveDirectory[] = L"C:\\TempPatchCleanerFiles";
+constexpr size_t kMaxFailureSamples = 5;
 
 const wchar_t* GetQuerySid(MSIINSTALLCONTEXT context,
                            const std::wstring& user_sid) {
@@ -139,7 +140,12 @@ bool EnsureDirectoryExists(const wchar_t* path) {
 }
 
 template <typename Action>
-bool ChangeFileWithWritableAttributes(const wchar_t* path, Action action) {
+bool ChangeFileWithWritableAttributes(const wchar_t* path, Action action,
+                                      bool* mutation_attempted = nullptr) {
+  if (mutation_attempted != nullptr) {
+    *mutation_attempted = false;
+  }
+
   auto attributes = GetFileAttributes(path);
   if (attributes == INVALID_FILE_ATTRIBUTES) {
     return false;
@@ -152,7 +158,14 @@ bool ChangeFileWithWritableAttributes(const wchar_t* path, Action action) {
   }
 
   if (action()) {
+    if (mutation_attempted != nullptr) {
+      *mutation_attempted = true;
+    }
     return true;
+  }
+
+  if (mutation_attempted != nullptr) {
+    *mutation_attempted = true;
   }
 
   if (was_read_only) {
@@ -160,6 +173,38 @@ bool ChangeFileWithWritableAttributes(const wchar_t* path, Action action) {
   }
 
   return false;
+}
+
+void RecordFailurePath(const std::wstring& path, int* failure_count,
+                       std::vector<std::wstring>* failure_samples) {
+  ++(*failure_count);
+  if (failure_samples->size() < kMaxFailureSamples) {
+    failure_samples->push_back(path);
+  }
+}
+
+CString BuildFailureMessage(const wchar_t* operation, int failure_count,
+                            const std::vector<std::wstring>& failure_samples) {
+  CString message;
+  message.Format(L"%s failed for %d selected file%s.", operation, failure_count,
+                 failure_count == 1 ? L"" : L"s");
+
+  if (!failure_samples.empty()) {
+    message.Append(L"\n\nExamples:");
+    for (const auto& path : failure_samples) {
+      message.Append(L"\n - ");
+      message.Append(path.c_str());
+    }
+
+    const auto remaining = failure_count - static_cast<int>(failure_samples.size());
+    if (remaining > 0) {
+      CString remaining_text;
+      remaining_text.Format(L"\n - ...and %d more.", remaining);
+      message.Append(remaining_text);
+    }
+  }
+
+  return message;
 }
 
 std::wstring GetFileNameFromPath(const std::wstring& path) {
@@ -515,6 +560,8 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
   }
 
   uint64_t moved_this_run = 0;
+  int move_failure_count = 0;
+  std::vector<std::wstring> move_failure_samples;
   auto destination_error = false;
   for (auto i = 0, ix = file_list_.GetItemCount(); i < ix; ++i) {
     auto state = file_list_.GetItemState(i, LVIS_STATEIMAGEMASK);
@@ -534,11 +581,19 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
       break;
     }
 
-    if (!ChangeFileWithWritableAttributes(file_item->path.c_str(), [&] {
-          return MoveFileEx(file_item->path.c_str(), destination.c_str(),
-                            MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH) !=
-                 FALSE;
-        })) {
+    auto mutation_attempted = false;
+    if (!ChangeFileWithWritableAttributes(
+            file_item->path.c_str(),
+            [&] {
+              return MoveFileEx(file_item->path.c_str(), destination.c_str(),
+                                MOVEFILE_COPY_ALLOWED |
+                                    MOVEFILE_WRITE_THROUGH) != FALSE;
+            },
+            &mutation_attempted)) {
+      if (mutation_attempted) {
+        RecordFailurePath(file_item->path, &move_failure_count,
+                          &move_failure_samples);
+      }
       continue;
     }
 
@@ -551,11 +606,18 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
     MessageBox(L"Could not access C:\\TempPatchCleanerFiles.", L"Patch Cleaner",
                MB_ICONERROR | MB_OK);
   }
+  if (move_failure_count > 0) {
+    auto message = BuildFailureMessage(L"Move to Temp", move_failure_count,
+                                       move_failure_samples);
+    MessageBox(message, L"Patch Cleaner", MB_ICONWARNING | MB_OK);
+  }
 }
 
 void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
                              CWindow /*control*/) {
   uint64_t deleted_this_run = 0;
+  int delete_failure_count = 0;
+  std::vector<std::wstring> delete_failure_samples;
   for (auto i = 0, ix = file_list_.GetItemCount(); i < ix; ++i) {
     auto state = file_list_.GetItemState(i, LVIS_STATEIMAGEMASK);
     if ((state & INDEXTOSTATEIMAGEMASK(2)) == 0)
@@ -567,9 +629,15 @@ void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
       continue;
     }
 
-    if (!ChangeFileWithWritableAttributes(file_item->path.c_str(), [&] {
-          return DeleteFile(file_item->path.c_str()) != FALSE;
-        })) {
+    auto mutation_attempted = false;
+    if (!ChangeFileWithWritableAttributes(
+            file_item->path.c_str(),
+            [&] { return DeleteFile(file_item->path.c_str()) != FALSE; },
+            &mutation_attempted)) {
+      if (mutation_attempted) {
+        RecordFailurePath(file_item->path, &delete_failure_count,
+                          &delete_failure_samples);
+      }
       continue;
     }
 
@@ -578,6 +646,11 @@ void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
 
   deleted_size_ += deleted_this_run;
   PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
+  if (delete_failure_count > 0) {
+    auto message = BuildFailureMessage(L"Delete", delete_failure_count,
+                                       delete_failure_samples);
+    MessageBox(message, L"Patch Cleaner", MB_ICONWARNING | MB_OK);
+  }
 }
 
 void MainFrame::ApplySort() {
