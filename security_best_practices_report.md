@@ -1,5 +1,7 @@
 # PatchCleaner Security Best Practices Review
 
+> Status update (2026-03-21): this document is the original review snapshot from before remediation. The fixes discussed here have since been implemented in the current workspace.
+
 ## Executive Summary
 
 PatchCleaner has a small native code surface and already includes a few good baseline defenses, notably safer DLL search-path setup, heap-corruption termination, `/sdl`, warnings-as-errors, and a fail-closed installer scan. The main security risk is not classic memory-unsafety in the reviewed files; it is the trust the app places in local filesystem state while running with administrator privileges.

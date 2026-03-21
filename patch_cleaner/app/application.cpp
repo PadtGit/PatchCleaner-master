@@ -2,6 +2,10 @@
 
 #include "app/application.h"
 
+#include <atlstr.h>
+#include <shellapi.h>
+#include <string>
+
 #include "ui/main_frame.h"
 
 namespace patch_cleaner {
@@ -71,13 +75,41 @@ void Application::RunMessageLoop() throw() {
 }  // namespace app
 }  // namespace patch_cleaner
 
+namespace {
+
+bool InitializeProcessSecurity() {
+  if (!HeapSetInformation(NULL, HeapEnableTerminationOnCorruption, nullptr, 0)) {
+    return false;
+  }
+
+  if (!SetSearchPathMode(BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE |
+                         BASE_SEARCH_PATH_PERMANENT)) {
+    return false;
+  }
+
+  if (!SetDllDirectory(L"")) {
+    return false;
+  }
+
+  return true;
+}
+
+int ShowFatalStartupError(DWORD error) {
+  CString message;
+  message.Format(L"Patch Cleaner could not enable required process hardening "
+                 L"(error %lu).",
+                 error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error);
+  MessageBox(nullptr, message, L"Patch Cleaner", MB_ICONERROR | MB_OK);
+  return static_cast<int>(error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error);
+}
+
+}  // namespace
+
 int __stdcall wWinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/,
                        wchar_t* /*command_line*/, int show_mode) {
-  HeapSetInformation(NULL, HeapEnableTerminationOnCorruption, nullptr, 0);
-
-  SetSearchPathMode(BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE |
-                    BASE_SEARCH_PATH_PERMANENT);
-  SetDllDirectory(L"");
+  if (!InitializeProcessSecurity()) {
+    return ShowFatalStartupError(GetLastError());
+  }
 
 #ifdef _DEBUG
   {
@@ -88,5 +120,29 @@ int __stdcall wWinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/,
   }
 #endif
 
-  return patch_cleaner::app::Application().WinMain(show_mode);
+  int argc = 0;
+  auto* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (argv != nullptr) {
+    const bool is_elevated_operation =
+        argc == 3 && wcscmp(argv[1], L"--elevated-operation") == 0;
+    if (is_elevated_operation) {
+      const std::wstring request_path = argv[2];
+      LocalFree(argv);
+
+      __try {
+        return patch_cleaner::ui::RunElevatedOperationRequest(
+            request_path.c_str());
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return static_cast<int>(GetExceptionCode());
+      }
+    }
+
+    LocalFree(argv);
+  }
+
+  __try {
+    return patch_cleaner::app::Application().WinMain(show_mode);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return static_cast<int>(GetExceptionCode());
+  }
 }

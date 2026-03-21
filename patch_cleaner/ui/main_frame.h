@@ -24,6 +24,8 @@
 namespace patch_cleaner {
 namespace ui {
 
+int RunElevatedOperationRequest(const wchar_t* request_path);
+
 class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
  public:
   MainFrame();
