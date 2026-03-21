@@ -11,22 +11,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Get-MsBuildPath {
-  $preferred = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
-  if (Test-Path $preferred) {
-    return $preferred
+  $canonical = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
+  if (Test-Path $canonical) {
+    return $canonical
   }
 
-  $fallback = "C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
-  if (Test-Path $fallback) {
-    return $fallback
-  }
-
-  $command = Get-Command msbuild.exe -ErrorAction SilentlyContinue
-  if ($null -ne $command) {
-    return $command.Source
-  }
-
-  throw "MSBuild.exe was not found. Install Visual Studio/Build Tools with C++ workload."
+  throw "MSBuild.exe was not found at $canonical."
 }
 
 function New-SanitizedProcessStartInfo {

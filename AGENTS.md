@@ -30,21 +30,28 @@
 
 ## Validation Commands
 
+- Preferred local wrapper for agent-driven builds:
+
+```powershell
+& '.\scripts\build-local.ps1' -Configuration Debug -Platform x64
+```
+
 - Primary build validation:
 
 ```powershell
-& 'C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe' 'PatchCleaner.sln' /t:Build /p:Configuration=Debug /p:Platform=x64 /m
+& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe' 'PatchCleaner.sln' /t:Build /p:Configuration=Debug /p:Platform=x64 /m
 ```
 
 - Optional alternate platform build:
 
 ```powershell
-& 'C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe' 'PatchCleaner.sln' /t:Build /p:Configuration=Debug /p:Platform=Win32 /m
+& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe' 'PatchCleaner.sln' /t:Build /p:Configuration=Debug /p:Platform=Win32 /m
 ```
 
 - Current environment caveat:
-  - The validated `Debug|x64` build command currently fails with `MSB8020` because the `v145` build tools are not installed in this environment.
-  - Report that blocker honestly. Do not claim a green build, and do not silently retarget the project or install toolsets unless the user explicitly asks.
+  - The canonical local `MSBuild.exe` path is `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe`.
+  - Direct `MSBuild.exe` invocation from this shell currently fails with `MSB6001` because the environment contains both `Path` and `PATH`; `scripts/build-local.ps1` sanitizes that before launching MSBuild.
+  - Report the actual blocker honestly. Do not claim a green build, and do not silently retarget the project or install toolsets unless the user explicitly asks.
 
 ## Workflow Rounds
 
@@ -84,7 +91,8 @@ The playbook-librarian may update only the two sections below during normal task
 - `PatchCleaner.sln` currently references exactly one project: `patch_cleaner/PatchCleaner.vcxproj`.
 - The project file explicitly lists source and resource membership, so file additions require deliberate vcxproj updates.
 - Build outputs exist under both `Build/*` and `patch_cleaner/Build/*`; treat both trees as generated artifacts.
-- The validated local `MSBuild.exe` path is `C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe`, but builds currently fail with `MSB8020` because `PlatformToolset=v145` is not installed.
+- The validated local `MSBuild.exe` path is `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe`.
+- Direct `MSBuild.exe` invocation from this Codex shell can fail with `MSB6001` due to duplicate `Path`/`PATH` environment entries; `scripts/build-local.ps1` normalizes the environment before launching MSBuild.
 - `.gitmodules` declares `third_party/wtl`, but this workspace copy does not have live Git metadata, so Git-backed workflows are unavailable here.
 - The application manifest currently requires administrator execution, and tasks should preserve that unless the user explicitly changes product behavior.
 

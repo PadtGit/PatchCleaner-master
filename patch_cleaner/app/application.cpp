@@ -103,6 +103,26 @@ int ShowFatalStartupError(DWORD error) {
   return static_cast<int>(error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error);
 }
 
+int RunElevatedOperationWithSeh(const wchar_t* request_path) {
+  __try {
+    return patch_cleaner::ui::RunElevatedOperationRequest(request_path);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return static_cast<int>(GetExceptionCode());
+  }
+}
+
+int RunApplicationMain(int show_mode) {
+  return patch_cleaner::app::Application().WinMain(show_mode);
+}
+
+int RunApplicationWithSeh(int show_mode) {
+  __try {
+    return RunApplicationMain(show_mode);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return static_cast<int>(GetExceptionCode());
+  }
+}
+
 }  // namespace
 
 int __stdcall wWinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/,
@@ -128,21 +148,11 @@ int __stdcall wWinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/,
     if (is_elevated_operation) {
       const std::wstring request_path = argv[2];
       LocalFree(argv);
-
-      __try {
-        return patch_cleaner::ui::RunElevatedOperationRequest(
-            request_path.c_str());
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return static_cast<int>(GetExceptionCode());
-      }
+      return RunElevatedOperationWithSeh(request_path.c_str());
     }
 
     LocalFree(argv);
   }
 
-  __try {
-    return patch_cleaner::app::Application().WinMain(show_mode);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return static_cast<int>(GetExceptionCode());
-  }
+  return RunApplicationWithSeh(show_mode);
 }

@@ -781,8 +781,9 @@ void RestoreFileAttributesIfNeeded(HANDLE handle,
                                    const FILE_BASIC_INFO& original_info,
                                    bool attributes_changed) {
   if (attributes_changed) {
-    SetFileInformationByHandle(handle, FileBasicInfo, &original_info,
-                               sizeof(original_info));
+    auto restored_info = original_info;
+    SetFileInformationByHandle(handle, FileBasicInfo, &restored_info,
+                               sizeof(restored_info));
   }
 }
 
