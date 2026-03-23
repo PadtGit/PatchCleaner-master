@@ -1008,11 +1008,9 @@ std::wstring GetFileNameFromPath(const std::wstring& path) {
   return path.substr(separator + 1);
 }
 
-std::wstring BuildMoveCandidateName(const std::wstring& file_name, int suffix) {
-  if (suffix == 0) {
-    return file_name;
-  }
-
+std::wstring BuildMoveCandidateName(const std::wstring& file_name,
+                                    const std::wstring& batch_token,
+                                    int suffix) {
   const auto extension = file_name.find_last_of(L'.');
   std::wstring base_name = file_name;
   std::wstring extension_name;
@@ -1021,28 +1019,65 @@ std::wstring BuildMoveCandidateName(const std::wstring& file_name, int suffix) {
     extension_name = file_name.substr(extension);
   }
 
-  CString suffix_text;
-  suffix_text.Format(L" (%d)", suffix);
-  return base_name + std::wstring(suffix_text.GetString()) + extension_name;
+  std::wstring candidate_name = base_name;
+  if (!batch_token.empty()) {
+    candidate_name.append(L" [").append(batch_token).append(L"]");
+  }
+
+  if (suffix > 0) {
+    CString suffix_text;
+    suffix_text.Format(L" (%d)", suffix);
+    candidate_name.append(suffix_text.GetString());
+  }
+
+  return candidate_name + extension_name;
+}
+
+bool CheckMoveNameAvailability(const std::wstring& destination_directory,
+                               const std::wstring& candidate_name,
+                               bool* available) {
+  auto candidate_path = destination_directory;
+  candidate_path.append(L"\\").append(candidate_name);
+
+  const auto attributes = GetFileAttributesW(candidate_path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    const auto error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+      *available = true;
+      return true;
+    }
+    return false;
+  }
+
+  *available = false;
+  return true;
 }
 
 bool BuildUniqueMoveName(const std::wstring& destination_directory,
                          const std::wstring& source_path,
+                         const std::wstring& batch_token,
                          std::wstring* destination_name) {
   const auto file_name = GetFileNameFromPath(source_path);
-  for (int suffix = 0;; ++suffix) {
-    auto candidate_name = BuildMoveCandidateName(file_name, suffix);
-    auto candidate_path = destination_directory;
-    candidate_path.append(L"\\").append(candidate_name);
+  auto available = false;
+  if (!CheckMoveNameAvailability(destination_directory, file_name, &available)) {
+    return false;
+  }
+  if (available) {
+    *destination_name = file_name;
+    return true;
+  }
 
-    const auto attributes = GetFileAttributesW(candidate_path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-      const auto error = GetLastError();
-      if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
-        *destination_name = std::move(candidate_name);
-        return true;
-      }
+  // Use a per-operation token before probing suffixes so old temp-root
+  // contents do not force an ever-growing linear scan.
+  for (int suffix = 0;; ++suffix) {
+    auto candidate_name = BuildMoveCandidateName(file_name, batch_token, suffix);
+    if (!CheckMoveNameAvailability(destination_directory, candidate_name,
+                                   &available)) {
       return false;
+    }
+    if (available) {
+      *destination_name = std::move(candidate_name);
+      return true;
     }
   }
 }
@@ -1119,7 +1154,8 @@ bool CopyAndDeleteOpenedFile(HANDLE source_handle,
 bool MoveInstallerCacheFile(const std::wstring& path,
                             const std::wstring& installer_directory,
                             const std::wstring& destination_directory,
-                            HANDLE destination_directory_handle) {
+                            HANDLE destination_directory_handle,
+                            const std::wstring& batch_token) {
   CHandle file_handle;
   FILE_BASIC_INFO original_info{};
   auto attributes_changed = false;
@@ -1130,7 +1166,8 @@ bool MoveInstallerCacheFile(const std::wstring& path,
   }
 
   std::wstring destination_name;
-  if (!BuildUniqueMoveName(destination_directory, path, &destination_name)) {
+  if (!BuildUniqueMoveName(destination_directory, path, batch_token,
+                           &destination_name)) {
     return false;
   }
 
@@ -1200,9 +1237,14 @@ bool ExecuteMoveOperation(const std::vector<std::wstring>& paths,
     return false;
   }
 
+  std::wstring batch_token;
+  if (!GenerateRandomHexString(8, &batch_token)) {
+    return false;
+  }
+
   for (const auto& path : paths) {
     if (MoveInstallerCacheFile(path, installer_directory, kTempMoveDirectory,
-                               root_directory_handle)) {
+                               root_directory_handle, batch_token)) {
       reply->succeeded_paths.push_back(path);
     } else {
       reply->failed_paths.push_back(path);
@@ -2586,9 +2628,7 @@ LRESULT MainFrame::PaintListCustomDraw(NMLVCUSTOMDRAW* draw) {
   switch (draw->nmcd.dwDrawStage) {
     case CDDS_PREPAINT:
       return CDRF_NOTIFYITEMDRAW;
-    case CDDS_ITEMPREPAINT:
-      return CDRF_NOTIFYSUBITEMDRAW;
-    case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+    case CDDS_ITEMPREPAINT: {
       const auto item_index = static_cast<int>(draw->nmcd.dwItemSpec);
       const auto selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
       const auto checked =

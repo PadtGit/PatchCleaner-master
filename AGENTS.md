@@ -98,10 +98,12 @@ The playbook-librarian may update only the two sections below during normal task
 - The application manifest currently requires administrator execution, and tasks should preserve that unless the user explicitly changes product behavior.
 - `tools/wtl.zip` should mirror the vendored `third_party/wtl` tree when refreshed so bootstrap artifacts cannot drift behind the headers actually used by the project.
 - The current Move to Temp behavior now writes directly into `C:\TempPatchCleanerFiles` and uses a validated copy-and-delete fallback when the same-volume handle rename is rejected by installer-cache files.
+- Move to Temp now keeps the plain filename when that slot is free and switches to a per-operation tokenized suffix only after a collision, so historical temp-root contents do not force an ever-growing `name (n)` probe loop.
 
 ## Improvement Notes
 
 - 2026-03-20: Added a repo-local PatchCleaner playbook, skill package, and subagent role files for staged exploration, implementation, critique, and playbook maintenance.
 - 2026-03-22: Refreshed the repo-local bootstrap artifacts by updating `tools/vs_BuildTools.exe`, rebuilding `tools/wtl.zip` from the current vendored WTL tree, and broadening `scripts/build-local.ps1` to find Visual Studio 2026 Build Tools installations.
 - 2026-03-22: Simplified Move to Temp to write directly into `C:\TempPatchCleanerFiles` and removed the unused per-run subdirectory path after validating the release build and manual user check.
+- 2026-03-23: Reduced UI repaint work by batching Select All updates, avoiding per-tick relayouts for flash-only animations, collapsing list custom draw to row-level notifications, and bounding Move to Temp collision checks with a per-operation tokenized fallback.
 - Keep this section focused on durable repo guidance, not task-by-task narrative.
