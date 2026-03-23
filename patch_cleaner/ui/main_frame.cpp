@@ -101,6 +101,20 @@ UINT GetWindowDpi(HWND window) {
   return kDefaultDpi;
 }
 
+bool IsProcessElevated() {
+  HANDLE raw_token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token)) {
+    return false;
+  }
+
+  CHandle token_handle(raw_token);
+  TOKEN_ELEVATION elevation{};
+  DWORD bytes_returned = 0;
+  return GetTokenInformation(token_handle, TokenElevation, &elevation,
+                             sizeof(elevation), &bytes_returned) != FALSE &&
+         elevation.TokenIsElevated != 0;
+}
+
 int ScaleForDpi(UINT dpi, int value) {
   return MulDiv(value, static_cast<int>(dpi), static_cast<int>(kDefaultDpi));
 }
@@ -1657,10 +1671,13 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
       NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 
   if (!scan_complete) {
-    MessageBox(
-        L"Patch Cleaner could not complete the installer scan safely, so no "
-        L"files were listed.",
-        L"Patch Cleaner", MB_ICONERROR | MB_OK);
+    const auto* message =
+        IsProcessElevated()
+            ? L"Patch Cleaner could not complete the installer scan safely, "
+              L"so no files were listed."
+            : L"Patch Cleaner must be run as an administrator to work. "
+              L"Relaunch the app with admin rights.";
+    MessageBox(message, L"Patch Cleaner", MB_ICONERROR | MB_OK);
   }
 }
 
@@ -2174,7 +2191,7 @@ void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) const {
               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
   auto detail_rect = text_rect;
-  detail_rect.top = state_rect.bottom + ScaleForDpi(dpi_, 2);
+  detail_rect.top = state_rect.bottom - ScaleForDpi(dpi_, 3);
   detail_rect.bottom = detail_rect.top + ScaleForDpi(dpi_, 20);
   dc.SelectFont(caption_font_);
   dc.SetTextColor(BlendColor(kMutedInkColor, kInkColor, 18));
