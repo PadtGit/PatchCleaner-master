@@ -799,44 +799,6 @@ bool BuildSecureDirectoryAttributes(SECURITY_ATTRIBUTES* attributes,
   return true;
 }
 
-bool CreateSecureMoveSubdirectory(const std::wstring& root_directory,
-                                  std::wstring* subdirectory_path,
-                                  CHandle* subdirectory_handle) {
-  SECURITY_ATTRIBUTES attributes{};
-  std::unique_ptr<void, LocalMemDeleter> descriptor_holder;
-  if (!BuildSecureDirectoryAttributes(&attributes, &descriptor_holder)) {
-    return false;
-  }
-
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    std::wstring random_suffix;
-    if (!GenerateRandomHexString(16, &random_suffix)) {
-      return false;
-    }
-
-    std::wstring candidate_path = root_directory;
-    candidate_path.append(L"\\").append(random_suffix);
-    if (!CreateDirectoryW(candidate_path.c_str(), &attributes)) {
-      if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        continue;
-      }
-      return false;
-    }
-
-    if (!OpenValidatedDirectory(candidate_path,
-                                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
-                                subdirectory_handle)) {
-      RemoveDirectoryW(candidate_path.c_str());
-      return false;
-    }
-
-    *subdirectory_path = candidate_path;
-    return true;
-  }
-
-  return false;
-}
-
 bool IsInstallerCacheExtension(const std::wstring& path) {
   return EndsWithIgnoreCase(path, L".msi") || EndsWithIgnoreCase(path, L".msp");
 }
@@ -1109,6 +1071,8 @@ bool MoveInstallerCacheFile(const std::wstring& path,
     return true;
   }
 
+  // Some installer cache files reject the in-place rename even after elevation.
+  // Fall back to a validated copy-and-delete so Move to Temp still succeeds.
   return CopyAndDeleteOpenedFile(file_handle, destination_path, original_info,
                                  attributes_changed);
 }

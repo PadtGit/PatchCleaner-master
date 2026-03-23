@@ -97,9 +97,11 @@ The playbook-librarian may update only the two sections below during normal task
 - `.gitmodules` declares `third_party/wtl`, but this workspace copy does not have live Git metadata, so Git-backed workflows are unavailable here.
 - The application manifest currently requires administrator execution, and tasks should preserve that unless the user explicitly changes product behavior.
 - `tools/wtl.zip` should mirror the vendored `third_party/wtl` tree when refreshed so bootstrap artifacts cannot drift behind the headers actually used by the project.
+- The current Move to Temp behavior now writes directly into `C:\TempPatchCleanerFiles` and uses a validated copy-and-delete fallback when the same-volume handle rename is rejected by installer-cache files.
 
 ## Improvement Notes
 
 - 2026-03-20: Added a repo-local PatchCleaner playbook, skill package, and subagent role files for staged exploration, implementation, critique, and playbook maintenance.
 - 2026-03-22: Refreshed the repo-local bootstrap artifacts by updating `tools/vs_BuildTools.exe`, rebuilding `tools/wtl.zip` from the current vendored WTL tree, and broadening `scripts/build-local.ps1` to find Visual Studio 2026 Build Tools installations.
+- 2026-03-22: Simplified Move to Temp to write directly into `C:\TempPatchCleanerFiles` and removed the unused per-run subdirectory path after validating the release build and manual user check.
 - Keep this section focused on durable repo guidance, not task-by-task narrative.
