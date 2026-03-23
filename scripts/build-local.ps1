@@ -11,12 +11,20 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Get-MsBuildPath {
-  $canonical = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
-  if (Test-Path $canonical) {
-    return $canonical
+  $candidates = @(
+    "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
+    "C:\Program Files\Microsoft Visual Studio\18\Professional\MSBuild\Current\Bin\MSBuild.exe"
+    "C:\Program Files\Microsoft Visual Studio\18\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
+    "C:\Program Files\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+  )
+
+  foreach ($candidate in $candidates) {
+    if (Test-Path $candidate) {
+      return $candidate
+    }
   }
 
-  throw "MSBuild.exe was not found at $canonical."
+  throw "MSBuild.exe was not found in the expected Visual Studio 2026 locations."
 }
 
 function New-SanitizedProcessStartInfo {

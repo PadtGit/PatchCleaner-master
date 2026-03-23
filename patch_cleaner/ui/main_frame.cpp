@@ -1051,6 +1051,21 @@ bool CopyOpenedFileToDestination(HANDLE source_handle,
   }
 }
 
+bool CopyAndDeleteOpenedFile(HANDLE source_handle,
+                             const std::wstring& destination_path,
+                             const FILE_BASIC_INFO& original_info,
+                             bool attributes_changed) {
+  if (CopyOpenedFileToDestination(source_handle, destination_path) &&
+      DeleteOpenedFile(source_handle)) {
+    return true;
+  }
+
+  DeleteFileW(destination_path.c_str());
+  RestoreFileAttributesIfNeeded(source_handle, original_info,
+                                attributes_changed);
+  return false;
+}
+
 bool MoveInstallerCacheFile(const std::wstring& path,
                             const std::wstring& installer_directory,
                             const std::wstring& destination_directory,
@@ -1085,14 +1100,8 @@ bool MoveInstallerCacheFile(const std::wstring& path,
       _wcsicmp(source_volume_root.c_str(), destination_volume_root.c_str()) ==
           0;
   if (!same_volume) {
-    if (CopyOpenedFileToDestination(file_handle, destination_path) &&
-        DeleteOpenedFile(file_handle)) {
-      return true;
-    }
-
-    DeleteFileW(destination_path.c_str());
-    RestoreFileAttributesIfNeeded(file_handle, original_info, attributes_changed);
-    return false;
+    return CopyAndDeleteOpenedFile(file_handle, destination_path, original_info,
+                                   attributes_changed);
   }
 
   if (RenameOpenedFileIntoDirectory(file_handle, destination_directory_handle,
@@ -1100,8 +1109,8 @@ bool MoveInstallerCacheFile(const std::wstring& path,
     return true;
   }
 
-  RestoreFileAttributesIfNeeded(file_handle, original_info, attributes_changed);
-  return false;
+  return CopyAndDeleteOpenedFile(file_handle, destination_path, original_info,
+                                 attributes_changed);
 }
 
 bool ExecuteDeleteOperation(const std::vector<std::wstring>& paths,

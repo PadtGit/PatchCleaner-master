@@ -93,10 +93,13 @@ The playbook-librarian may update only the two sections below during normal task
 - Build outputs exist under both `Build/*` and `patch_cleaner/Build/*`; treat both trees as generated artifacts.
 - The validated local `MSBuild.exe` path is `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe`.
 - Direct `MSBuild.exe` invocation from this Codex shell can fail with `MSB6001` due to duplicate `Path`/`PATH` environment entries; `scripts/build-local.ps1` normalizes the environment before launching MSBuild.
+- `scripts/build-local.ps1` now probes Visual Studio 2026 Community, Professional, Enterprise, and Build Tools MSBuild paths before failing, so repo-local bootstrapper updates do not require script edits to remain usable.
 - `.gitmodules` declares `third_party/wtl`, but this workspace copy does not have live Git metadata, so Git-backed workflows are unavailable here.
 - The application manifest currently requires administrator execution, and tasks should preserve that unless the user explicitly changes product behavior.
+- `tools/wtl.zip` should mirror the vendored `third_party/wtl` tree when refreshed so bootstrap artifacts cannot drift behind the headers actually used by the project.
 
 ## Improvement Notes
 
 - 2026-03-20: Added a repo-local PatchCleaner playbook, skill package, and subagent role files for staged exploration, implementation, critique, and playbook maintenance.
+- 2026-03-22: Refreshed the repo-local bootstrap artifacts by updating `tools/vs_BuildTools.exe`, rebuilding `tools/wtl.zip` from the current vendored WTL tree, and broadening `scripts/build-local.ps1` to find Visual Studio 2026 Build Tools installations.
 - Keep this section focused on durable repo guidance, not task-by-task narrative.
