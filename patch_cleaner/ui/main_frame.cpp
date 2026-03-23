@@ -48,6 +48,7 @@ enum class MutationOperation {
 
 struct MutationReply {
   bool destination_error = false;
+  bool completed = false;
   std::vector<std::wstring> succeeded_paths;
   std::vector<std::wstring> failed_paths;
 };
@@ -63,6 +64,9 @@ struct LocalMemDeleter {
 bool BuildSecureDirectoryAttributes(
     SECURITY_ATTRIBUTES* attributes,
     std::unique_ptr<void, LocalMemDeleter>* descriptor_holder);
+bool GetExecutablePath(std::wstring* executable_path);
+bool OpenValidatedDirectory(const std::wstring& path, DWORD desired_access,
+                            CHandle* directory_handle);
 
 constexpr wchar_t kAllUsersSid[] = L"s-1-1-0";
 constexpr wchar_t kTempMoveDirectory[] = L"C:\\TempPatchCleanerFiles";
@@ -73,10 +77,12 @@ constexpr wchar_t kOperationDeleteToken[] = L"delete";
 constexpr wchar_t kResultSuccessPrefix[] = L"ok\t";
 constexpr wchar_t kResultFailurePrefix[] = L"fail\t";
 constexpr wchar_t kResultDestinationError[] = L"destination_error";
+constexpr wchar_t kResultCompleted[] = L"completed";
 constexpr wchar_t kSecureSubdirectorySddl[] =
     L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 constexpr size_t kMaxFailureSamples = 5;
 constexpr UINT kDefaultDpi = 96;
+constexpr DWORD kResponsivePumpStride = 32;
 
 COLORREF BlendColor(COLORREF from, COLORREF to, int percent) {
   percent = std::max(0, std::min(100, percent));
@@ -142,6 +148,19 @@ CString FormatClockTime(const SYSTEMTIME& time) {
   }
 
   return CString(buffer);
+}
+
+void PumpMessageRange(UINT message) {
+  MSG queued_message{};
+  while (PeekMessage(&queued_message, nullptr, message, message, PM_REMOVE)) {
+    TranslateMessage(&queued_message);
+    DispatchMessage(&queued_message);
+  }
+}
+
+void PumpResponsiveUiMessages() {
+  PumpMessageRange(WM_TIMER);
+  PumpMessageRange(WM_PAINT);
 }
 
 void FillRectColor(CDCHandle dc, const RECT& rect, COLORREF color) {
@@ -419,7 +438,8 @@ bool WriteWideLinesFile(const std::wstring& path,
   DWORD written = 0;
   return WriteFile(file, content.data(), size_in_bytes, &written, nullptr) !=
              FALSE &&
-         written == size_in_bytes;
+         written == size_in_bytes &&
+         FlushFileBuffers(file) != FALSE;
 }
 
 bool ReadWideLinesFile(const std::wstring& path,
@@ -502,6 +522,10 @@ std::wstring BuildResultPath(const std::wstring& request_path) {
   return request_path + L".result";
 }
 
+std::wstring BuildProgressPath(const std::wstring& request_path) {
+  return request_path + L".progress";
+}
+
 bool WriteOperationRequest(MutationOperation operation,
                            const std::vector<std::wstring>& paths,
                            std::wstring* request_path,
@@ -509,6 +533,12 @@ bool WriteOperationRequest(MutationOperation operation,
   std::wstring operation_directory;
   if (!GetOperationDirectory(&operation_directory) ||
       !EnsureDirectoryChainExists(operation_directory)) {
+    return false;
+  }
+
+  CHandle operation_directory_handle;
+  if (!OpenValidatedDirectory(operation_directory, FILE_GENERIC_READ,
+                              &operation_directory_handle)) {
     return false;
   }
 
@@ -566,6 +596,10 @@ bool WriteOperationReply(const std::wstring& result_path,
     lines.emplace_back(std::wstring(kResultFailurePrefix).append(path));
   }
 
+  if (reply.completed) {
+    lines.push_back(kResultCompleted);
+  }
+
   return WriteWideLinesFile(result_path, lines, false);
 }
 
@@ -576,6 +610,7 @@ bool ReadOperationReply(const std::wstring& result_path, MutationReply* reply) {
   }
 
   reply->destination_error = false;
+  reply->completed = false;
   reply->succeeded_paths.clear();
   reply->failed_paths.clear();
 
@@ -593,7 +628,37 @@ bool ReadOperationReply(const std::wstring& result_path, MutationReply* reply) {
 
     if (StartsWithIgnoreCase(line, kResultFailurePrefix)) {
       reply->failed_paths.push_back(line.substr(wcslen(kResultFailurePrefix)));
+      continue;
     }
+
+    if (_wcsicmp(line.c_str(), kResultCompleted) == 0) {
+      reply->completed = true;
+    }
+  }
+
+  return true;
+}
+
+bool RelaunchApplicationElevated(HWND owner_window) {
+  std::wstring executable_path;
+  if (!GetExecutablePath(&executable_path)) {
+    return false;
+  }
+
+  SHELLEXECUTEINFOW execute_info{};
+  execute_info.cbSize = sizeof(execute_info);
+  execute_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  execute_info.hwnd = owner_window;
+  execute_info.lpVerb = L"runas";
+  execute_info.lpFile = executable_path.c_str();
+  execute_info.nShow = SW_SHOWNORMAL;
+
+  if (!ShellExecuteExW(&execute_info)) {
+    return false;
+  }
+
+  if (execute_info.hProcess != nullptr) {
+    CloseHandle(execute_info.hProcess);
   }
 
   return true;
@@ -628,8 +693,10 @@ bool LaunchElevatedOperation(MutationOperation operation,
   if (!WriteOperationRequest(operation, paths, &request_path, &result_path)) {
     return false;
   }
+  const auto progress_path = BuildProgressPath(request_path);
 
   const auto cleanup = [&]() {
+    DeleteFileW(progress_path.c_str());
     DeleteFileW(result_path.c_str());
     DeleteFileW(request_path.c_str());
   };
@@ -660,10 +727,31 @@ bool LaunchElevatedOperation(MutationOperation operation,
     return false;
   }
 
-  WaitForSingleObject(execute_info.hProcess, INFINITE);
+  HANDLE process_handle = execute_info.hProcess;
+  for (;;) {
+    const auto wait_result =
+        MsgWaitForMultipleObjects(1, &process_handle, FALSE, 50,
+                                  QS_PAINT | QS_TIMER);
+    if (wait_result == WAIT_OBJECT_0) {
+      break;
+    }
+
+    if (wait_result == WAIT_OBJECT_0 + 1 || wait_result == WAIT_TIMEOUT) {
+      PumpResponsiveUiMessages();
+      continue;
+    }
+
+    CloseHandle(execute_info.hProcess);
+    cleanup();
+    return false;
+  }
+
   CloseHandle(execute_info.hProcess);
 
-  const auto read_success = ReadOperationReply(result_path, reply);
+  auto read_success = ReadOperationReply(result_path, reply);
+  if (!read_success) {
+    read_success = ReadOperationReply(progress_path, reply);
+  }
   cleanup();
   return read_success;
 }
@@ -1078,6 +1166,7 @@ bool MoveInstallerCacheFile(const std::wstring& path,
 }
 
 bool ExecuteDeleteOperation(const std::vector<std::wstring>& paths,
+                            const std::wstring& progress_path,
                             MutationReply* reply) {
   std::wstring installer_directory;
   if (!GetInstallerDirectory(&installer_directory)) {
@@ -1090,12 +1179,15 @@ bool ExecuteDeleteOperation(const std::vector<std::wstring>& paths,
     } else {
       reply->failed_paths.push_back(path);
     }
+
+    WriteOperationReply(progress_path, *reply);
   }
 
   return true;
 }
 
 bool ExecuteMoveOperation(const std::vector<std::wstring>& paths,
+                          const std::wstring& progress_path,
                           MutationReply* reply) {
   std::wstring installer_directory;
   if (!GetInstallerDirectory(&installer_directory)) {
@@ -1115,6 +1207,8 @@ bool ExecuteMoveOperation(const std::vector<std::wstring>& paths,
     } else {
       reply->failed_paths.push_back(path);
     }
+
+    WriteOperationReply(progress_path, *reply);
   }
 
   return true;
@@ -1175,6 +1269,7 @@ void EnumFiles(const std::wstring& base_path, const wchar_t* pattern,
     return;
   }
 
+  DWORD enumerated = 0;
   do {
     if ((find_data.dwFileAttributes &
          (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
@@ -1188,6 +1283,11 @@ void EnumFiles(const std::wstring& base_path, const wchar_t* pattern,
     size.HighPart = find_data.nFileSizeHigh;
 
     output->insert({path, size.QuadPart});
+
+    ++enumerated;
+    if ((enumerated % kResponsivePumpStride) == 0) {
+      PumpResponsiveUiMessages();
+    }
   } while (FindNextFileW(find, &find_data));
 
   FindClose(find);
@@ -1225,6 +1325,9 @@ bool RemoveInstalledPackages(FileSizeMap* files) {
     }
 
     files->erase(local_package);
+    if ((index % kResponsivePumpStride) == 0) {
+      PumpResponsiveUiMessages();
+    }
   }
 
   return true;
@@ -1264,6 +1367,9 @@ bool RemoveInstalledPatches(FileSizeMap* files) {
     }
 
     files->erase(local_package);
+    if ((index % kResponsivePumpStride) == 0) {
+      PumpResponsiveUiMessages();
+    }
   }
 
   return true;
@@ -1328,10 +1434,16 @@ MainFrame::MainFrame()
       moved_flash_(0),
       deleted_flash_(0),
       scan_flash_(0),
+      cached_path_column_width_(0),
+      cached_size_column_width_(0),
       sort_ascending_(true),
+      batching_selection_changes_(false),
+      pending_selection_refresh_(false),
       tracking_mouse_(false),
       has_last_scan_(false),
-      last_scan_succeeded_(false) {
+      last_scan_succeeded_(false),
+      recovered_last_operation_(false),
+      busy_operation_(BusyOperation::kNone) {
   ZeroMemory(&last_scan_time_, sizeof(last_scan_time_));
 }
 
@@ -1377,8 +1489,7 @@ int MainFrame::OnCreate(CREATESTRUCT* /*create*/) {
   file_list_.InsertColumn(1, &column);
 
   SyncListAppearance();
-  LayoutChildren();
-  RefreshChrome();
+  RefreshChrome(false, true);
   BeginSettleAnimation();
 
   return 0;
@@ -1484,20 +1595,34 @@ void MainFrame::OnTimer(UINT_PTR event_id) {
   }
 
   const auto action_target = selected_count_ > 0 ? 100 : 0;
-  auto animating = false;
-  animating |= StepAnimationToward(&reveal_progress_, 100, 18);
-  animating |= StepAnimationToward(&action_progress_, action_target, 20);
-  animating |= DecayFlashValue(&selected_flash_, 12);
-  animating |= DecayFlashValue(&moved_flash_, 10);
-  animating |= DecayFlashValue(&deleted_flash_, 10);
-  animating |= DecayFlashValue(&scan_flash_, 10);
+  const auto reveal_changed = StepAnimationToward(&reveal_progress_, 100, 18);
+  const auto action_changed =
+      StepAnimationToward(&action_progress_, action_target, 20);
+  const auto selected_flash_changed = DecayFlashValue(&selected_flash_, 12);
+  const auto moved_flash_changed = DecayFlashValue(&moved_flash_, 10);
+  const auto deleted_flash_changed = DecayFlashValue(&deleted_flash_, 10);
+  const auto scan_flash_changed = DecayFlashValue(&scan_flash_, 10);
+  const auto animating =
+      reveal_changed || action_changed || selected_flash_changed ||
+      moved_flash_changed || deleted_flash_changed || scan_flash_changed;
 
   if (!animating) {
     KillTimer(kAnimationTimerId);
   }
 
-  LayoutChildren();
-  Invalidate(FALSE);
+  if (reveal_changed || action_changed) {
+    LayoutChildren();
+    Invalidate(FALSE);
+    return;
+  }
+
+  if (scan_flash_changed) {
+    InvalidateRect(command_band_rect_, FALSE);
+    InvalidateRect(list_frame_rect_, FALSE);
+  }
+  if (selected_flash_changed || moved_flash_changed || deleted_flash_changed) {
+    InvalidateRect(action_rail_rect_, FALSE);
+  }
 }
 
 void MainFrame::OnSetFocus(CWindow /*old_window*/) {
@@ -1538,7 +1663,11 @@ LRESULT MainFrame::OnItemChanged(NMHDR* header) {
         selected_count_ = std::max(0, selected_count_ - 1);
       }
 
-      RefreshChrome(true);
+      if (batching_selection_changes_) {
+        pending_selection_refresh_ = true;
+      } else {
+        RefreshChrome(true);
+      }
     }
   }
 
@@ -1568,8 +1697,35 @@ LRESULT MainFrame::OnDeleteItem(NMHDR* header) {
 
 void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
                              CWindow /*control*/) {
+  if (IsBusy()) {
+    return;
+  }
+
+  if (!IsProcessElevated()) {
+    const auto response = MessageBox(
+        L"Patch Cleaner needs administrator access to scan the Windows "
+        L"Installer cache safely.\n\nRelaunch as administrator now?",
+        L"Patch Cleaner", MB_ICONQUESTION | MB_YESNO);
+    if (response == IDYES) {
+      if (RelaunchApplicationElevated(m_hWnd)) {
+        PostMessage(WM_CLOSE);
+      } else if (GetLastError() != ERROR_CANCELLED) {
+        MessageBox(L"Patch Cleaner could not relaunch itself with "
+                   L"administrator rights.",
+                   L"Patch Cleaner", MB_ICONERROR | MB_OK);
+      }
+    }
+    return;
+  }
+
+  SetBusyOperation(BusyOperation::kScanning);
+  recovered_last_operation_ = false;
+  InvalidateRect(command_band_rect_, FALSE);
+  InvalidateRect(action_rail_rect_, FALSE);
+
   std::wstring cache_path;
   if (!GetInstallerDirectory(&cache_path)) {
+    ClearBusyOperation();
     MessageBox(L"Patch Cleaner could not resolve the Windows Installer cache.",
                L"Patch Cleaner", MB_ICONERROR | MB_OK);
     return;
@@ -1619,6 +1775,9 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
     }
 
     ++count;
+    if ((count % static_cast<int>(kResponsivePumpStride)) == 0) {
+      PumpResponsiveUiMessages();
+    }
   }
 
   GetLocalTime(&last_scan_time_);
@@ -1629,32 +1788,53 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
   ApplySort();
   scan_flash_ = 100;
   BeginSettleAnimation();
-  RefreshChrome();
+  RefreshChrome(false, true);
 
   file_list_.SetRedraw(TRUE);
   file_list_.RedrawWindow(
       NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+  ClearBusyOperation();
 
   if (!scan_complete) {
-    const auto* message =
-        IsProcessElevated()
-            ? L"Patch Cleaner could not complete the installer scan safely, "
-              L"so no files were listed."
-            : L"Patch Cleaner must be run as an administrator to work. "
-              L"Relaunch the app with admin rights.";
-    MessageBox(message, L"Patch Cleaner", MB_ICONERROR | MB_OK);
+    MessageBox(L"Patch Cleaner could not complete the installer scan safely, "
+               L"so no files were listed.",
+               L"Patch Cleaner", MB_ICONERROR | MB_OK);
   }
 }
 
 void MainFrame::OnEditSelectAll(UINT /*notify_code*/, int /*id*/,
                                 CWindow /*control*/) {
+  if (IsBusy() || file_list_.GetItemCount() == 0) {
+    return;
+  }
+
+  batching_selection_changes_ = true;
+  pending_selection_refresh_ = false;
+  file_list_.SetRedraw(FALSE);
+  auto any_changed = false;
   for (auto i = 0, ix = file_list_.GetItemCount(); i < ix; ++i) {
-    file_list_.SetCheckState(i, TRUE);
+    if (file_list_.GetCheckState(i) == FALSE) {
+      any_changed = true;
+      file_list_.SetCheckState(i, TRUE);
+    }
+  }
+  file_list_.SetRedraw(TRUE);
+  file_list_.RedrawWindow(
+      NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+  batching_selection_changes_ = false;
+  RecalculateSelectionTotals();
+  if (pending_selection_refresh_ || any_changed) {
+    pending_selection_refresh_ = false;
+    RefreshChrome(true);
   }
 }
 
 void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
                                  CWindow /*control*/) {
+  if (IsBusy()) {
+    return;
+  }
+
   std::vector<std::wstring> paths;
   FileSizeMap selected_sizes;
   for (auto i = 0, ix = file_list_.GetItemCount(); i < ix; ++i) {
@@ -1677,13 +1857,20 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
     return;
   }
 
+  SetBusyOperation(BusyOperation::kMoveToTemp);
+  recovered_last_operation_ = false;
+  InvalidateRect(command_band_rect_, FALSE);
+  InvalidateRect(action_rail_rect_, FALSE);
+
   MutationReply reply;
   bool canceled = false;
   if (!LaunchElevatedOperation(MutationOperation::kMoveToTemp, paths, &reply,
                                &canceled)) {
+    ClearBusyOperation();
     if (!canceled) {
       MessageBox(L"Patch Cleaner could not complete the elevated move request.",
                  L"Patch Cleaner", MB_ICONERROR | MB_OK);
+      PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
     }
     return;
   }
@@ -1700,12 +1887,20 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
   if (moved_this_run > 0) {
     moved_flash_ = 100;
   }
+  recovered_last_operation_ = !reply.completed;
   PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
   RefreshChrome();
+  ClearBusyOperation();
 
   if (reply.destination_error) {
     MessageBox(L"Could not access C:\\TempPatchCleanerFiles securely.",
                L"Patch Cleaner", MB_ICONERROR | MB_OK);
+  }
+
+  if (!reply.completed) {
+    MessageBox(L"Move to Temp ended unexpectedly. Patch Cleaner recovered the "
+               L"partial results it could and started a fresh scan.",
+               L"Patch Cleaner", MB_ICONWARNING | MB_OK);
   }
 
   if (!reply.failed_paths.empty()) {
@@ -1724,6 +1919,10 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
 
 void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
                              CWindow /*control*/) {
+  if (IsBusy()) {
+    return;
+  }
+
   std::vector<std::wstring> paths;
   FileSizeMap selected_sizes;
   for (auto i = 0, ix = file_list_.GetItemCount(); i < ix; ++i) {
@@ -1746,14 +1945,21 @@ void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
     return;
   }
 
+  SetBusyOperation(BusyOperation::kDelete);
+  recovered_last_operation_ = false;
+  InvalidateRect(command_band_rect_, FALSE);
+  InvalidateRect(action_rail_rect_, FALSE);
+
   MutationReply reply;
   bool canceled = false;
   if (!LaunchElevatedOperation(MutationOperation::kDelete, paths, &reply,
                                &canceled)) {
+    ClearBusyOperation();
     if (!canceled) {
       MessageBox(L"Patch Cleaner could not complete the elevated delete "
                  L"request.",
                  L"Patch Cleaner", MB_ICONERROR | MB_OK);
+      PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
     }
     return;
   }
@@ -1770,8 +1976,16 @@ void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
   if (deleted_this_run > 0) {
     deleted_flash_ = 100;
   }
+  recovered_last_operation_ = !reply.completed;
   PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
   RefreshChrome();
+  ClearBusyOperation();
+
+  if (!reply.completed) {
+    MessageBox(L"Delete ended unexpectedly. Patch Cleaner recovered the "
+               L"partial results it could and started a fresh scan.",
+               L"Patch Cleaner", MB_ICONWARNING | MB_OK);
+  }
 
   if (!reply.failed_paths.empty()) {
     int delete_failure_count = 0;
@@ -1791,6 +2005,54 @@ void MainFrame::ApplySort() {
   if (file_list_.GetItemCount() > 1) {
     file_list_.SortItems(CompareFileItems, reinterpret_cast<LPARAM>(this));
   }
+}
+
+void MainFrame::RecalculateSelectionTotals() {
+  selected_size_ = 0;
+  selected_count_ = 0;
+  for (auto i = 0, ix = file_list_.GetItemCount(); i < ix; ++i) {
+    if (file_list_.GetCheckState(i) == FALSE) {
+      continue;
+    }
+
+    const auto* file_item =
+        reinterpret_cast<const FileItem*>(file_list_.GetItemData(i));
+    if (file_item == nullptr) {
+      continue;
+    }
+
+    selected_size_ += file_item->size;
+    ++selected_count_;
+  }
+}
+
+void MainFrame::SetBusyOperation(BusyOperation operation) {
+  if (busy_operation_ == operation) {
+    return;
+  }
+
+  busy_operation_ = operation;
+  if (file_list_.IsWindow()) {
+    file_list_.EnableWindow(!IsBusy());
+  }
+
+  if (IsBusy()) {
+    UpdateHotButton(0);
+    if (GetCapture() == m_hWnd) {
+      ReleaseCapture();
+    }
+    pressed_button_ = 0;
+  }
+
+  Invalidate(FALSE);
+}
+
+void MainFrame::ClearBusyOperation() {
+  SetBusyOperation(BusyOperation::kNone);
+}
+
+bool MainFrame::IsBusy() const {
+  return busy_operation_ != BusyOperation::kNone;
 }
 
 void MainFrame::RebuildFonts() {
@@ -1930,18 +2192,30 @@ void MainFrame::UpdateListColumns() {
   const auto path_column_width =
       std::max(ScaleForDpi(dpi_, 240),
                list_rect.Width() - size_column_width - ScaleForDpi(dpi_, 28));
-  file_list_.SetColumnWidth(0, path_column_width);
-  file_list_.SetColumnWidth(1, size_column_width);
+  if (cached_path_column_width_ != path_column_width) {
+    file_list_.SetColumnWidth(0, path_column_width);
+    cached_path_column_width_ = path_column_width;
+  }
+  if (cached_size_column_width_ != size_column_width) {
+    file_list_.SetColumnWidth(1, size_column_width);
+    cached_size_column_width_ = size_column_width;
+  }
 }
 
-void MainFrame::RefreshChrome(bool pulse_selection) {
+void MainFrame::RefreshChrome(bool pulse_selection, bool relayout) {
   if (pulse_selection) {
     selected_flash_ = 100;
   }
 
-  LayoutChildren();
+  if (relayout) {
+    LayoutChildren();
+  }
   EnsureAnimationTimer();
-  Invalidate(FALSE);
+  if (relayout) {
+    Invalidate(FALSE);
+  } else {
+    InvalidateRect(action_rail_rect_, FALSE);
+  }
 }
 
 void MainFrame::BeginSettleAnimation() {
@@ -1996,6 +2270,10 @@ CRect MainFrame::GetButtonRect(int command_id) const {
 }
 
 bool MainFrame::IsButtonEnabled(int command_id) const {
+  if (IsBusy()) {
+    return false;
+  }
+
   switch (command_id) {
     case kButtonScan:
       return true;
@@ -2335,6 +2613,10 @@ LRESULT MainFrame::PaintListCustomDraw(NMLVCUSTOMDRAW* draw) {
 }
 
 CString MainFrame::BuildScanStateLine() const {
+  if (busy_operation_ == BusyOperation::kScanning) {
+    return CString(L"Scanning Windows Installer cache...");
+  }
+
   if (!has_last_scan_) {
     return CString(L"Ready to scan the Windows Installer cache.");
   }
@@ -2354,6 +2636,11 @@ CString MainFrame::BuildScanStateLine() const {
 }
 
 CString MainFrame::BuildScanDetailLine() const {
+  if (busy_operation_ == BusyOperation::kScanning) {
+    return CString(L"Reviewing MSI and MSP files while keeping the window "
+                   L"responsive.");
+  }
+
   if (!has_last_scan_) {
     return CString(
         L"Scan reviews MSI and MSP leftovers in the Windows Installer cache.");
@@ -2372,6 +2659,18 @@ CString MainFrame::BuildScanDetailLine() const {
 }
 
 CString MainFrame::BuildSelectionStateLine() const {
+  if (busy_operation_ == BusyOperation::kMoveToTemp) {
+    return CString(L"Move to Temp is running | actions are paused");
+  }
+
+  if (busy_operation_ == BusyOperation::kDelete) {
+    return CString(L"Delete is running | actions are paused");
+  }
+
+  if (busy_operation_ == BusyOperation::kScanning) {
+    return CString(L"Scanning in progress | actions are temporarily disabled");
+  }
+
   CString state_line;
   if (selected_count_ > 0) {
     state_line.Format(L"Selected %d file%s | %s chosen", selected_count_,
@@ -2385,6 +2684,16 @@ CString MainFrame::BuildSelectionStateLine() const {
 }
 
 CString MainFrame::BuildSelectionDetailLine() const {
+  if (busy_operation_ != BusyOperation::kNone) {
+    return CString(
+        L"Patch Cleaner will refresh the file list after the current task.");
+  }
+
+  if (recovered_last_operation_) {
+    return CString(L"Recovered partial elevated results and refreshed the "
+                   L"installer cache.");
+  }
+
   CString detail_line;
   detail_line.Format(L"Moved %s | Deleted %s | Temp destination %s",
                      static_cast<LPCWSTR>(FormatSizeString(moved_size_)),
@@ -2458,11 +2767,14 @@ int RunElevatedOperationRequest(const wchar_t* request_path) {
     return ERROR_INVALID_DATA;
   }
 
+  const auto progress_path = BuildProgressPath(request_path);
   MutationReply reply;
   const auto success =
       operation == MutationOperation::kMoveToTemp
-          ? ExecuteMoveOperation(paths, &reply)
-          : ExecuteDeleteOperation(paths, &reply);
+          ? ExecuteMoveOperation(paths, progress_path, &reply)
+          : ExecuteDeleteOperation(paths, progress_path, &reply);
+  reply.completed = success;
+  WriteOperationReply(progress_path, reply);
 
   if (!WriteOperationReply(BuildResultPath(request_path), reply)) {
     return GetLastError() == ERROR_SUCCESS ? ERROR_WRITE_FAULT

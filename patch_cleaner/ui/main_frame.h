@@ -63,6 +63,13 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   END_MSG_MAP()
 
  private:
+  enum class BusyOperation {
+    kNone,
+    kScanning,
+    kMoveToTemp,
+    kDelete,
+  };
+
   enum Controls {
     IDC_FILE_LIST = 1,
   };
@@ -100,12 +107,16 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   void OnFileMoveToTemp(UINT notify_code, int id, CWindow control);
   void OnEditDelete(UINT notify_code, int id, CWindow control);
   void ApplySort();
+  void RecalculateSelectionTotals();
   void RebuildFonts();
   void DisposeFonts();
+  void SetBusyOperation(BusyOperation operation);
+  void ClearBusyOperation();
+  bool IsBusy() const;
   void SyncListAppearance();
   void LayoutChildren();
   void UpdateListColumns();
-  void RefreshChrome(bool pulse_selection = false);
+  void RefreshChrome(bool pulse_selection = false, bool relayout = false);
   void BeginSettleAnimation();
   void EnsureAnimationTimer();
   int GetButtonAtPoint(CPoint point) const;
@@ -145,10 +156,16 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   int moved_flash_;
   int deleted_flash_;
   int scan_flash_;
+  int cached_path_column_width_;
+  int cached_size_column_width_;
   bool sort_ascending_;
+  bool batching_selection_changes_;
+  bool pending_selection_refresh_;
   bool tracking_mouse_;
   bool has_last_scan_;
   bool last_scan_succeeded_;
+  bool recovered_last_operation_;
+  BusyOperation busy_operation_;
   SYSTEMTIME last_scan_time_;
   CRect command_band_rect_;
   CRect list_frame_rect_;
