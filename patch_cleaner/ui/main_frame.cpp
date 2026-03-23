@@ -1144,17 +1144,9 @@ bool ExecuteMoveOperation(const std::vector<std::wstring>& paths,
     return false;
   }
 
-  std::wstring secure_subdirectory;
-  CHandle secure_subdirectory_handle;
-  if (!CreateSecureMoveSubdirectory(kTempMoveDirectory, &secure_subdirectory,
-                                    &secure_subdirectory_handle)) {
-    reply->destination_error = true;
-    return false;
-  }
-
   for (const auto& path : paths) {
-    if (MoveInstallerCacheFile(path, installer_directory, secure_subdirectory,
-                               secure_subdirectory_handle)) {
+    if (MoveInstallerCacheFile(path, installer_directory, kTempMoveDirectory,
+                               root_directory_handle)) {
       reply->succeeded_paths.push_back(path);
     } else {
       reply->failed_paths.push_back(path);
