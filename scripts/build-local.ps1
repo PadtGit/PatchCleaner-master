@@ -72,14 +72,49 @@ function New-SanitizedProcessStartInfo {
   return $psi
 }
 
+function Test-StaleIntermediatePaths {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$RepoRoot,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ProjectName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Configuration,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Platform
+  )
+
+  $intDir = Join-Path $RepoRoot "Build\$ProjectName\$Configuration.$Platform"
+  $manifestRcPath = Join-Path $intDir "${ProjectName}_manifest.rc"
+  if (Test-Path $manifestRcPath) {
+    $expectedManifestPath = (Join-Path $intDir "$ProjectName.exe.embed.manifest").Replace('\', '\\')
+    $manifestContent = Get-Content $manifestRcPath -Raw
+    if ($manifestContent -notlike "*$expectedManifestPath*") {
+      return $true
+    }
+  }
+
+  return $false
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $projectPath = Join-Path $repoRoot "patch_cleaner\PatchCleaner.vcxproj"
 if (-not (Test-Path $projectPath)) {
   throw "Project file not found: $projectPath"
 }
 
+$projectName = [System.IO.Path]::GetFileNameWithoutExtension($projectPath)
 $msbuildPath = Get-MsBuildPath
-$target = if ($Clean) { "Clean;Build" } else { "Build" }
+$forceClean = $Clean
+if (-not $forceClean -and (Test-StaleIntermediatePaths -RepoRoot $repoRoot -ProjectName $projectName -Configuration $Configuration -Platform $Platform)) {
+  Write-Host "Detected stale build intermediates for $Configuration|$Platform. Forcing Clean;Build."
+  $forceClean = $true
+}
+
+$target = if ($forceClean) { "Clean;Build" } else { "Build" }
 
 $args = @(
   "`"$projectPath`""

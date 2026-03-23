@@ -11,6 +11,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <algorithm>
+#include <array>
 #include <map>
 #include <cstring>
 #include <memory>
@@ -24,9 +26,6 @@ namespace ui {
 
 namespace {
 
-typedef CWinTraitsOR<TBSTYLE_TOOLTIPS | TBSTYLE_LIST, TBSTYLE_EX_MIXEDBUTTONS>
-    ToolBarWinTraits;
-typedef CWinTraitsOR<SBARS_SIZEGRIP> StatusBarWinTraits;
 typedef CWinTraitsOR<LVS_REPORT | LVS_SHOWSELALWAYS> FileListWinTraits;
 
 struct FileItem {
@@ -77,6 +76,128 @@ constexpr wchar_t kResultDestinationError[] = L"destination_error";
 constexpr wchar_t kSecureSubdirectorySddl[] =
     L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 constexpr size_t kMaxFailureSamples = 5;
+constexpr UINT kDefaultDpi = 96;
+
+COLORREF BlendColor(COLORREF from, COLORREF to, int percent) {
+  percent = std::max(0, std::min(100, percent));
+  const auto blend_channel = [&](BYTE left, BYTE right) {
+    return static_cast<BYTE>(
+        left + ((right - left) * percent + (right > left ? 50 : -50)) / 100);
+  };
+
+  return RGB(blend_channel(GetRValue(from), GetRValue(to)),
+             blend_channel(GetGValue(from), GetGValue(to)),
+             blend_channel(GetBValue(from), GetBValue(to)));
+}
+
+UINT GetWindowDpi(HWND window) {
+  if (window != nullptr) {
+    const auto dpi = GetDpiForWindow(window);
+    if (dpi != 0) {
+      return dpi;
+    }
+  }
+
+  return kDefaultDpi;
+}
+
+int ScaleForDpi(UINT dpi, int value) {
+  return MulDiv(value, static_cast<int>(dpi), static_cast<int>(kDefaultDpi));
+}
+
+CString FormatSizeString(uint64_t size) {
+  static const wchar_t* kUnits[]{L"B", L"KB", L"MB", L"GB", L"TB"};
+
+  auto scaled_size = static_cast<double>(size);
+  auto unit_index = 0;
+  for (; scaled_size >= 1024.0 && unit_index < _countof(kUnits) - 1;
+       ++unit_index) {
+    scaled_size /= 1024.0;
+  }
+
+  wchar_t buffer[32];
+  swprintf_s(buffer, L"%.1lf %s", scaled_size, kUnits[unit_index]);
+  return CString(buffer);
+}
+
+CString FormatClockTime(const SYSTEMTIME& time) {
+  wchar_t buffer[64]{};
+  if (GetTimeFormatEx(nullptr, TIME_NOSECONDS, &time, nullptr, buffer,
+                      _countof(buffer)) == 0) {
+    return CString(L"recently");
+  }
+
+  return CString(buffer);
+}
+
+void FillRectColor(CDCHandle dc, const RECT& rect, COLORREF color) {
+  dc.FillSolidRect(&rect, color);
+}
+
+void DrawRectOutline(CDCHandle dc, const RECT& rect, COLORREF color) {
+  CPen pen;
+  pen.CreatePen(PS_SOLID, 1, color);
+  const auto old_pen = dc.SelectPen(pen);
+  const auto old_brush = dc.SelectStockBrush(NULL_BRUSH);
+  dc.Rectangle(&rect);
+  dc.SelectBrush(old_brush);
+  dc.SelectPen(old_pen);
+}
+
+void FillRoundedRect(CDCHandle dc, const RECT& rect, COLORREF fill_color,
+                     COLORREF border_color, int radius) {
+  CPen pen;
+  pen.CreatePen(PS_SOLID, 1, border_color);
+  CBrush brush;
+  brush.CreateSolidBrush(fill_color);
+  const auto old_pen = dc.SelectPen(pen);
+  const auto old_brush = dc.SelectBrush(brush);
+  dc.RoundRect(rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+  dc.SelectBrush(old_brush);
+  dc.SelectPen(old_pen);
+}
+
+void DrawChevron(CDCHandle dc, const RECT& rect, bool ascending,
+                 COLORREF color) {
+  CPen pen;
+  pen.CreatePen(PS_SOLID, 2, color);
+  const auto old_pen = dc.SelectPen(pen);
+  const auto old_brush = dc.SelectStockBrush(NULL_BRUSH);
+
+  const auto center_x = (rect.left + rect.right) / 2;
+  const auto center_y = (rect.top + rect.bottom) / 2;
+  const auto half_width =
+      std::max<int>(2, static_cast<int>((rect.right - rect.left) / 4));
+  const auto half_height =
+      std::max<int>(2, static_cast<int>((rect.bottom - rect.top) / 4));
+
+  if (ascending) {
+    dc.MoveTo(center_x - half_width, center_y + half_height / 2);
+    dc.LineTo(center_x, center_y - half_height);
+    dc.LineTo(center_x + half_width, center_y + half_height / 2);
+  } else {
+    dc.MoveTo(center_x - half_width, center_y - half_height / 2);
+    dc.LineTo(center_x, center_y + half_height);
+    dc.LineTo(center_x + half_width, center_y - half_height / 2);
+  }
+
+  dc.SelectBrush(old_brush);
+  dc.SelectPen(old_pen);
+}
+
+LOGFONT BuildBaseUiFont() {
+  NONCLIENTMETRICS metrics{};
+  metrics.cbSize = sizeof(metrics);
+  if (SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics,
+                           0) != FALSE) {
+    return metrics.lfMessageFont;
+  }
+
+  LOGFONT font{};
+  font.lfHeight = -12;
+  wcscpy_s(font.lfFaceName, L"Segoe UI");
+  return font;
+}
 
 const wchar_t* GetQuerySid(MSIINSTALLCONTEXT context,
                            const std::wstring& user_sid) {
@@ -1066,10 +1187,6 @@ int FormatSize(uint64_t size, wchar_t (&buffer)[length]) {
   return swprintf_s(buffer, L"%.1lf %s", double_size, kUnits[index]);
 }
 
-double ToMegabytes(uint64_t size) {
-  return static_cast<double>(size) / (1024.0 * 1024.0);
-}
-
 void EnumFiles(const std::wstring& base_path, const wchar_t* pattern,
                FileSizeMap* output) {
   auto query = base_path + pattern;
@@ -1173,14 +1290,71 @@ bool RemoveInstalledPatches(FileSizeMap* files) {
   return true;
 }
 
+constexpr COLORREF kWindowBackground = RGB(243, 238, 232);
+constexpr COLORREF kCommandBandBackground = RGB(249, 246, 241);
+constexpr COLORREF kListFrameBackground = RGB(255, 253, 250);
+constexpr COLORREF kActionRailBackground = RGB(247, 243, 238);
+constexpr COLORREF kPanelBorder = RGB(219, 209, 198);
+constexpr COLORREF kDividerColor = RGB(227, 218, 208);
+constexpr COLORREF kInkColor = RGB(38, 34, 30);
+constexpr COLORREF kMutedInkColor = RGB(111, 99, 87);
+constexpr COLORREF kAccentColor = RGB(173, 110, 66);
+constexpr COLORREF kAccentDarkColor = RGB(144, 90, 55);
+constexpr COLORREF kDangerColor = RGB(145, 67, 58);
+constexpr COLORREF kDisabledInkColor = RGB(155, 145, 137);
+constexpr COLORREF kDisabledFillColor = RGB(233, 227, 220);
+constexpr COLORREF kButtonTextOnAccent = RGB(252, 248, 242);
+constexpr COLORREF kListStripeColor = RGB(252, 250, 247);
+constexpr COLORREF kListSelectedColor = RGB(242, 228, 216);
+
+bool StepAnimationToward(int* value, int target, int step) {
+  if (*value == target) {
+    return false;
+  }
+
+  if (*value < target) {
+    *value = std::min(target, *value + step);
+  } else {
+    *value = std::max(target, *value - step);
+  }
+
+  return true;
+}
+
+bool DecayFlashValue(int* value, int amount) {
+  if (*value == 0) {
+    return false;
+  }
+
+  *value = std::max(0, *value - amount);
+  return true;
+}
+
 }  // namespace
 
 MainFrame::MainFrame()
-    : selected_size_(0),
+    : dpi_(kDefaultDpi),
+      selected_size_(0),
       moved_size_(0),
       deleted_size_(0),
+      total_reclaimable_size_(0),
+      selected_count_(0),
+      total_reclaimable_count_(0),
       sort_column_(0),
-      sort_ascending_(true) {}
+      hot_button_(0),
+      pressed_button_(0),
+      reveal_progress_(0),
+      action_progress_(0),
+      selected_flash_(0),
+      moved_flash_(0),
+      deleted_flash_(0),
+      scan_flash_(0),
+      sort_ascending_(true),
+      tracking_mouse_(false),
+      has_last_scan_(false),
+      last_scan_succeeded_(false) {
+  ZeroMemory(&last_scan_time_, sizeof(last_scan_time_));
+}
 
 BOOL MainFrame::PreTranslateMessage(MSG* message) {
   if (CFrameWindowImpl::PreTranslateMessage(message)) {
@@ -1191,86 +1365,178 @@ BOOL MainFrame::PreTranslateMessage(MSG* message) {
 }
 
 int MainFrame::OnCreate(CREATESTRUCT* /*create*/) {
+  dpi_ = GetWindowDpi(m_hWnd);
+  ModifyStyle(0, WS_CLIPCHILDREN);
+
   if (!app::GetApplication()->GetMessageLoop()->AddMessageFilter(this)) {
     return -1;
   }
 
-  CBitmap tool_bar_bitmap;
-  tool_bar_bitmap = AtlLoadBitmapImage(IDR_MAIN, LR_CREATEDIBSECTION);
-  if (tool_bar_bitmap.IsNull()) {
-    return -1;
-  }
-
-  if (!tool_bar_image_.Create(16, 16, ILC_COLOR32, 0, 2)) {
-    return -1;
-  }
-
-  if (tool_bar_image_.Add(tool_bar_bitmap) == -1) {
-    return -1;
-  }
-
-  m_hWndToolBar = tool_bar_.Create(
-      m_hWnd, nullptr, nullptr, ToolBarWinTraits::GetWndStyle(0),
-      ToolBarWinTraits::GetWndExStyle(0), ATL_IDW_TOOLBAR);
-  if (tool_bar_.IsWindow()) {
-    tool_bar_.SetImageList(tool_bar_image_);
-    tool_bar_.AddString(ID_FILE_UPDATE);
-    tool_bar_.AddString(ID_EDIT_DELETE);
-  } else {
-    return -1;
-  }
-
-  tool_bar_.AddButton(ID_FILE_UPDATE, BTNS_AUTOSIZE | BTNS_SHOWTEXT,
-                      TBSTATE_ENABLED, 0, MAKEINTRESOURCE(0), 0);
-  tool_bar_.AddButton(ID_EDIT_SELECT_ALL, BTNS_AUTOSIZE | BTNS_SHOWTEXT,
-                      TBSTATE_ENABLED, I_IMAGENONE, L"Select All", 0);
-  tool_bar_.AddButton(ID_FILE_MOVE_TO_TEMP, BTNS_AUTOSIZE | BTNS_SHOWTEXT,
-                      TBSTATE_ENABLED, I_IMAGENONE, L"Move to Temp", 0);
-  tool_bar_.AddButton(ID_EDIT_DELETE, BTNS_AUTOSIZE | BTNS_SHOWTEXT,
-                      TBSTATE_ENABLED, 1, MAKEINTRESOURCE(1), 0);
-
-  m_hWndStatusBar = status_bar_.Create(m_hWnd, nullptr, nullptr,
-                                       StatusBarWinTraits::GetWndStyle(0),
-                                       StatusBarWinTraits::GetWndExStyle(0));
-  if (!status_bar_.IsWindow()) {
-    return -1;
-  }
+  RebuildFonts();
 
   m_hWndClient = file_list_.Create(
       m_hWnd, nullptr, nullptr, FileListWinTraits::GetWndStyle(0),
       FileListWinTraits::GetWndExStyle(0), IDC_FILE_LIST);
-  if (file_list_.IsWindow()) {
-    file_list_.SetExtendedListViewStyle(
-        LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
-        LVS_EX_SIMPLESELECT | LVS_EX_AUTOSIZECOLUMNS);
-
-    LVCOLUMN column{LVCF_FMT | LVCF_WIDTH | LVCF_TEXT};
-    column.fmt = LVCFMT_LEFT;
-    column.cx = 250;
-    column.pszText = L"Path";
-    file_list_.InsertColumn(0, &column);
-
-    column.fmt = LVCFMT_RIGHT;
-    column.cx = 80;
-    column.pszText = L"Size";
-    file_list_.InsertColumn(1, &column);
-  } else {
+  if (!file_list_.IsWindow()) {
     return -1;
   }
 
-  RefreshStatusBar();
+  file_list_.ModifyStyleEx(WS_EX_CLIENTEDGE, 0);
+  file_list_.SetExtendedListViewStyle(
+      LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
+      LVS_EX_SIMPLESELECT | LVS_EX_AUTOSIZECOLUMNS);
+
+  LVCOLUMN column{LVCF_FMT | LVCF_WIDTH | LVCF_TEXT};
+  column.fmt = LVCFMT_LEFT;
+  column.cx = ScaleForDpi(dpi_, 250);
+  column.pszText = L"Path";
+  file_list_.InsertColumn(0, &column);
+
+  column.fmt = LVCFMT_RIGHT;
+  column.cx = ScaleForDpi(dpi_, 104);
+  column.pszText = L"Size";
+  file_list_.InsertColumn(1, &column);
+
+  SyncListAppearance();
+  LayoutChildren();
+  RefreshChrome();
+  BeginSettleAnimation();
 
   return 0;
 }
 
 void MainFrame::OnDestroy() {
+  KillTimer(kAnimationTimerId);
+  if (GetCapture() == m_hWnd) {
+    ReleaseCapture();
+  }
+
   SetMsgHandled(FALSE);
 
   app::GetApplication()->GetMessageLoop()->RemoveMessageFilter(this);
+  DisposeFonts();
+}
+
+void MainFrame::OnSize(UINT /*type*/, CSize /*size*/) {
+  LayoutChildren();
+  Invalidate(FALSE);
+}
+
+void MainFrame::OnPaint(CDCHandle dc) {
+  CDCHandle target_dc(dc);
+  if (target_dc == nullptr) {
+    CPaintDC paint_dc(m_hWnd);
+    OnPaint(paint_dc.m_hDC);
+    return;
+  }
+
+  CRect client_rect;
+  GetClientRect(&client_rect);
+  if (client_rect.IsRectEmpty()) {
+    return;
+  }
+
+  CDC memory_dc;
+  memory_dc.CreateCompatibleDC(target_dc);
+
+  CBitmap buffer_bitmap;
+  buffer_bitmap.CreateCompatibleBitmap(target_dc, client_rect.Width(),
+                                       client_rect.Height());
+  const auto old_bitmap = memory_dc.SelectBitmap(buffer_bitmap);
+
+  PaintChrome(memory_dc.m_hDC);
+
+  target_dc.BitBlt(0, 0, client_rect.Width(), client_rect.Height(), memory_dc,
+                   0, 0, SRCCOPY);
+  memory_dc.SelectBitmap(old_bitmap);
+}
+
+BOOL MainFrame::OnEraseBkgnd(CDCHandle /*dc*/) {
+  return TRUE;
+}
+
+void MainFrame::OnMouseMove(UINT /*flags*/, CPoint point) {
+  if (!tracking_mouse_) {
+    TRACKMOUSEEVENT track_event{};
+    track_event.cbSize = sizeof(track_event);
+    track_event.dwFlags = TME_LEAVE;
+    track_event.hwndTrack = m_hWnd;
+    tracking_mouse_ = TrackMouseEvent(&track_event) != FALSE;
+  }
+
+  UpdateHotButton(GetButtonAtPoint(point));
+}
+
+void MainFrame::OnMouseLeave() {
+  tracking_mouse_ = false;
+  UpdateHotButton(0);
+}
+
+void MainFrame::OnLButtonDown(UINT /*flags*/, CPoint point) {
+  const auto command_id = GetButtonAtPoint(point);
+  if (command_id == 0) {
+    SetMsgHandled(FALSE);
+    return;
+  }
+
+  pressed_button_ = command_id;
+  SetCapture();
+  InvalidateRect(GetButtonRect(command_id), FALSE);
+}
+
+void MainFrame::OnLButtonUp(UINT /*flags*/, CPoint point) {
+  const auto was_pressed = pressed_button_;
+  if (GetCapture() == m_hWnd) {
+    ReleaseCapture();
+  }
+
+  pressed_button_ = 0;
+  if (was_pressed != 0) {
+    InvalidateRect(GetButtonRect(was_pressed), FALSE);
+    if (was_pressed == GetButtonAtPoint(point)) {
+      InvokeSurfaceButton(was_pressed);
+    }
+  }
+}
+
+void MainFrame::OnTimer(UINT_PTR event_id) {
+  if (event_id != kAnimationTimerId) {
+    return;
+  }
+
+  const auto action_target = selected_count_ > 0 ? 100 : 0;
+  auto animating = false;
+  animating |= StepAnimationToward(&reveal_progress_, 100, 18);
+  animating |= StepAnimationToward(&action_progress_, action_target, 20);
+  animating |= DecayFlashValue(&selected_flash_, 12);
+  animating |= DecayFlashValue(&moved_flash_, 10);
+  animating |= DecayFlashValue(&deleted_flash_, 10);
+  animating |= DecayFlashValue(&scan_flash_, 10);
+
+  if (!animating) {
+    KillTimer(kAnimationTimerId);
+  }
+
+  LayoutChildren();
+  Invalidate(FALSE);
+}
+
+void MainFrame::OnSetFocus(CWindow /*old_window*/) {
+  if (file_list_.IsWindow()) {
+    file_list_.SetFocus();
+  }
+}
+
+void MainFrame::OnGetMinMaxInfo(MINMAXINFO* min_max_info) {
+  min_max_info->ptMinTrackSize.x = ScaleForDpi(dpi_, 820);
+  min_max_info->ptMinTrackSize.y = ScaleForDpi(dpi_, 560);
 }
 
 LRESULT MainFrame::OnItemChanged(NMHDR* header) {
   auto data = reinterpret_cast<NMLISTVIEW*>(header);
+  if (data->iItem < 0) {
+    return 0;
+  }
 
   if (data->uChanged & LVIF_STATE) {
     auto old_checked =
@@ -1287,11 +1553,13 @@ LRESULT MainFrame::OnItemChanged(NMHDR* header) {
 
       if (new_checked) {
         selected_size_ += file_item->size;
+        ++selected_count_;
       } else {
         selected_size_ -= file_item->size;
+        selected_count_ = std::max(0, selected_count_ - 1);
       }
 
-      RefreshStatusBar();
+      RefreshChrome(true);
     }
   }
 
@@ -1308,6 +1576,7 @@ LRESULT MainFrame::OnColumnClick(NMHDR* header) {
   }
 
   ApplySort();
+  InvalidateRect(list_frame_rect_, FALSE);
   return 0;
 }
 
@@ -1334,6 +1603,12 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
       RemoveInstalledPackages(&files) && RemoveInstalledPatches(&files);
   if (!scan_complete) {
     files.clear();
+  }
+
+  total_reclaimable_count_ = static_cast<int>(files.size());
+  total_reclaimable_size_ = 0;
+  for (const auto& pair : files) {
+    total_reclaimable_size_ += pair.second;
   }
 
   file_list_.SetRedraw(FALSE);
@@ -1367,9 +1642,15 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
     ++count;
   }
 
+  GetLocalTime(&last_scan_time_);
+  has_last_scan_ = true;
+  last_scan_succeeded_ = scan_complete;
   selected_size_ = 0;
+  selected_count_ = 0;
   ApplySort();
-  RefreshStatusBar();
+  scan_flash_ = 100;
+  BeginSettleAnimation();
+  RefreshChrome();
 
   file_list_.SetRedraw(TRUE);
   file_list_.RedrawWindow(
@@ -1434,7 +1715,11 @@ void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
   }
 
   moved_size_ += moved_this_run;
+  if (moved_this_run > 0) {
+    moved_flash_ = 100;
+  }
   PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
+  RefreshChrome();
 
   if (reply.destination_error) {
     MessageBox(L"Could not access C:\\TempPatchCleanerFiles securely.",
@@ -1500,7 +1785,11 @@ void MainFrame::OnEditDelete(UINT /*notify_code*/, int /*id*/,
   }
 
   deleted_size_ += deleted_this_run;
+  if (deleted_this_run > 0) {
+    deleted_flash_ = 100;
+  }
   PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
+  RefreshChrome();
 
   if (!reply.failed_paths.empty()) {
     int delete_failure_count = 0;
@@ -1522,13 +1811,636 @@ void MainFrame::ApplySort() {
   }
 }
 
-void MainFrame::RefreshStatusBar() {
-  CString status_text;
-  status_text.Format(
-      L"Selected: %.2f MB | Moved: %.2f MB | Deleted: %.2f MB",
-      ToMegabytes(selected_size_), ToMegabytes(moved_size_),
-      ToMegabytes(deleted_size_));
-  status_bar_.SetText(0, status_text);
+void MainFrame::RebuildFonts() {
+  DisposeFonts();
+
+  const auto base_font = BuildBaseUiFont();
+  const auto create_font = [&](CFont* font, int point_size, LONG weight) {
+    LOGFONT face = base_font;
+    face.lfHeight = -MulDiv(point_size, static_cast<int>(dpi_), 72);
+    face.lfWeight = weight;
+    face.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+    font->CreateFontIndirect(&face);
+  };
+
+  create_font(&headline_font_, 9, FW_SEMIBOLD);
+  create_font(&title_font_, 24, FW_SEMIBOLD);
+  create_font(&body_font_, 10, FW_NORMAL);
+  create_font(&caption_font_, 9, FW_NORMAL);
+  create_font(&button_font_, 10, FW_SEMIBOLD);
+}
+
+void MainFrame::DisposeFonts() {
+  if (!headline_font_.IsNull()) {
+    headline_font_.DeleteObject();
+  }
+  if (!title_font_.IsNull()) {
+    title_font_.DeleteObject();
+  }
+  if (!body_font_.IsNull()) {
+    body_font_.DeleteObject();
+  }
+  if (!caption_font_.IsNull()) {
+    caption_font_.DeleteObject();
+  }
+  if (!button_font_.IsNull()) {
+    button_font_.DeleteObject();
+  }
+}
+
+void MainFrame::SyncListAppearance() {
+  if (!file_list_.IsWindow()) {
+    return;
+  }
+
+  file_list_.SetBkColor(kListFrameBackground);
+  file_list_.SetTextBkColor(kListFrameBackground);
+  file_list_.SetTextColor(kInkColor);
+  file_list_.SetFont(body_font_);
+
+  CHeaderCtrl header(file_list_.GetHeader());
+  if (header.IsWindow()) {
+    header.SetFont(button_font_);
+  }
+}
+
+void MainFrame::LayoutChildren() {
+  if (!file_list_.IsWindow()) {
+    return;
+  }
+
+  CRect client_rect;
+  GetClientRect(&client_rect);
+  if (client_rect.IsRectEmpty()) {
+    return;
+  }
+
+  const auto outer = ScaleForDpi(dpi_, 20);
+  const auto gap = ScaleForDpi(dpi_, 14);
+  const auto command_height = ScaleForDpi(dpi_, 182);
+  const auto action_height = ScaleForDpi(dpi_, 96) +
+                             MulDiv(ScaleForDpi(dpi_, 34), action_progress_, 100);
+  const auto settle_offset =
+      MulDiv(ScaleForDpi(dpi_, 12), 100 - reveal_progress_, 100);
+
+  command_band_rect_.SetRect(outer, outer, client_rect.right - outer,
+                             outer + command_height);
+  action_rail_rect_.SetRect(outer, client_rect.bottom - outer - action_height,
+                            client_rect.right - outer, client_rect.bottom - outer);
+  list_frame_rect_.SetRect(outer, command_band_rect_.bottom + gap,
+                           client_rect.right - outer, action_rail_rect_.top - gap);
+
+  const auto button_height = ScaleForDpi(dpi_, 42);
+  const auto button_gap = ScaleForDpi(dpi_, 10);
+  const auto button_padding_right = ScaleForDpi(dpi_, 24);
+  const auto scan_width = ScaleForDpi(dpi_, 148);
+  const auto scan_top = command_band_rect_.top + ScaleForDpi(dpi_, 42) +
+                        settle_offset / 3;
+  scan_button_rect_.SetRect(command_band_rect_.right - button_padding_right -
+                                scan_width,
+                            scan_top,
+                            command_band_rect_.right - button_padding_right,
+                            scan_top + button_height);
+
+  const auto delete_width = ScaleForDpi(dpi_, 114);
+  const auto move_width = ScaleForDpi(dpi_, 156);
+  const auto select_width = ScaleForDpi(dpi_, 122);
+  const auto button_top = action_rail_rect_.bottom - ScaleForDpi(dpi_, 22) -
+                          button_height;
+
+  delete_button_rect_.SetRect(action_rail_rect_.right - button_padding_right -
+                                  delete_width,
+                              button_top,
+                              action_rail_rect_.right - button_padding_right,
+                              button_top + button_height);
+  move_to_temp_button_rect_.SetRect(delete_button_rect_.left - button_gap -
+                                        move_width,
+                                    button_top,
+                                    delete_button_rect_.left - button_gap,
+                                    button_top + button_height);
+  select_all_button_rect_.SetRect(move_to_temp_button_rect_.left - button_gap -
+                                      select_width,
+                                  button_top,
+                                  move_to_temp_button_rect_.left - button_gap,
+                                  button_top + button_height);
+
+  auto list_rect = list_frame_rect_;
+  list_rect.DeflateRect(1, 1);
+  list_rect.top += settle_offset;
+  file_list_.SetWindowPos(nullptr, list_rect.left, list_rect.top,
+                          list_rect.Width(), list_rect.Height(),
+                          SWP_NOACTIVATE | SWP_NOZORDER);
+  UpdateListColumns();
+}
+
+void MainFrame::UpdateListColumns() {
+  if (!file_list_.IsWindow()) {
+    return;
+  }
+
+  CRect list_rect;
+  file_list_.GetClientRect(&list_rect);
+  if (list_rect.IsRectEmpty()) {
+    return;
+  }
+
+  const auto size_column_width = ScaleForDpi(dpi_, 112);
+  const auto path_column_width =
+      std::max(ScaleForDpi(dpi_, 240),
+               list_rect.Width() - size_column_width - ScaleForDpi(dpi_, 28));
+  file_list_.SetColumnWidth(0, path_column_width);
+  file_list_.SetColumnWidth(1, size_column_width);
+}
+
+void MainFrame::RefreshChrome(bool pulse_selection) {
+  if (pulse_selection) {
+    selected_flash_ = 100;
+  }
+
+  LayoutChildren();
+  EnsureAnimationTimer();
+  Invalidate(FALSE);
+}
+
+void MainFrame::BeginSettleAnimation() {
+  reveal_progress_ = 0;
+  EnsureAnimationTimer();
+}
+
+void MainFrame::EnsureAnimationTimer() {
+  const auto action_target = selected_count_ > 0 ? 100 : 0;
+  const auto should_run = reveal_progress_ < 100 ||
+                          action_progress_ != action_target ||
+                          selected_flash_ > 0 || moved_flash_ > 0 ||
+                          deleted_flash_ > 0 || scan_flash_ > 0;
+  if (should_run) {
+    SetTimer(kAnimationTimerId, 15);
+  } else {
+    KillTimer(kAnimationTimerId);
+  }
+}
+
+int MainFrame::GetButtonAtPoint(CPoint point) const {
+  const std::array<int, 4> buttons{{
+      kButtonScan,
+      kButtonSelectAll,
+      kButtonMoveToTemp,
+      kButtonDelete,
+  }};
+
+  for (const auto command_id : buttons) {
+    if (IsButtonEnabled(command_id) &&
+        GetButtonRect(command_id).PtInRect(point)) {
+      return command_id;
+    }
+  }
+
+  return 0;
+}
+
+CRect MainFrame::GetButtonRect(int command_id) const {
+  switch (command_id) {
+    case kButtonScan:
+      return scan_button_rect_;
+    case kButtonSelectAll:
+      return select_all_button_rect_;
+    case kButtonMoveToTemp:
+      return move_to_temp_button_rect_;
+    case kButtonDelete:
+      return delete_button_rect_;
+    default:
+      return CRect();
+  }
+}
+
+bool MainFrame::IsButtonEnabled(int command_id) const {
+  switch (command_id) {
+    case kButtonScan:
+      return true;
+    case kButtonSelectAll:
+      return file_list_.IsWindow() && file_list_.GetItemCount() > 0;
+    case kButtonMoveToTemp:
+    case kButtonDelete:
+      return selected_count_ > 0;
+    default:
+      return false;
+  }
+}
+
+void MainFrame::UpdateHotButton(int command_id) {
+  if (hot_button_ == command_id) {
+    return;
+  }
+
+  const auto old_button = hot_button_;
+  hot_button_ = command_id;
+  if (old_button != 0) {
+    InvalidateRect(GetButtonRect(old_button), FALSE);
+  }
+  if (hot_button_ != 0) {
+    InvalidateRect(GetButtonRect(hot_button_), FALSE);
+  }
+}
+
+void MainFrame::InvokeSurfaceButton(int command_id) {
+  if (!IsButtonEnabled(command_id)) {
+    return;
+  }
+
+  SendMessage(WM_COMMAND, MAKEWPARAM(command_id, 0), 0);
+}
+
+void MainFrame::DrawSurfaceButton(CDCHandle dc, const CRect& rect,
+                                  int command_id) const {
+  if (rect.IsRectEmpty()) {
+    return;
+  }
+
+  const auto enabled = IsButtonEnabled(command_id);
+  const auto hot = enabled && hot_button_ == command_id;
+  const auto pressed = enabled && pressed_button_ == command_id;
+  const auto primary =
+      command_id == kButtonScan || command_id == kButtonMoveToTemp;
+  const auto destructive = command_id == kButtonDelete;
+
+  COLORREF fill_color = primary ? kAccentColor : kActionRailBackground;
+  COLORREF border_color = primary ? kAccentDarkColor : kPanelBorder;
+  COLORREF text_color = primary ? kButtonTextOnAccent : kInkColor;
+  if (!enabled) {
+    fill_color = primary ? BlendColor(kDisabledFillColor, kAccentColor, 12)
+                         : kDisabledFillColor;
+    border_color = BlendColor(kPanelBorder, kActionRailBackground, 20);
+    text_color = kDisabledInkColor;
+  } else if (destructive) {
+    fill_color = hot ? BlendColor(kActionRailBackground, kDangerColor, 16)
+                     : BlendColor(kActionRailBackground, kDangerColor, 6);
+    border_color = BlendColor(kDangerColor, kActionRailBackground,
+                              hot ? 5 : 18);
+    text_color = hot ? kDangerColor : BlendColor(kInkColor, kDangerColor, 70);
+  } else if (!primary) {
+    fill_color = hot ? BlendColor(kActionRailBackground, kAccentColor, 10)
+                     : kActionRailBackground;
+    border_color = hot ? BlendColor(kPanelBorder, kAccentColor, 45)
+                       : kPanelBorder;
+  }
+
+  if (pressed && enabled) {
+    fill_color = BlendColor(fill_color, RGB(32, 28, 24), 10);
+    border_color = BlendColor(border_color, RGB(32, 28, 24), 12);
+  }
+
+  FillRoundedRect(dc, rect, fill_color, border_color, ScaleForDpi(dpi_, 14));
+
+  CString label;
+  switch (command_id) {
+    case kButtonScan:
+      label = L"Scan";
+      break;
+    case kButtonSelectAll:
+      label = L"Select All";
+      break;
+    case kButtonMoveToTemp:
+      label = L"Move to Temp";
+      break;
+    case kButtonDelete:
+      label = L"Delete";
+      break;
+  }
+
+  const auto old_font = dc.SelectFont(button_font_);
+  const auto old_mode = dc.SetBkMode(TRANSPARENT);
+  const auto old_color = dc.SetTextColor(text_color);
+  auto text_rect = rect;
+  dc.DrawText(label, label.GetLength(), &text_rect,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  dc.SetTextColor(old_color);
+  dc.SetBkMode(old_mode);
+  dc.SelectFont(old_font);
+}
+
+void MainFrame::PaintChrome(CDCHandle dc) {
+  CRect client_rect;
+  GetClientRect(&client_rect);
+
+  FillRectColor(dc, client_rect, kWindowBackground);
+  PaintCommandBand(dc, command_band_rect_);
+  PaintListFrame(dc, list_frame_rect_);
+  PaintActionRail(dc, action_rail_rect_);
+}
+
+void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) const {
+  FillRectColor(dc, rect, kCommandBandBackground);
+
+  const auto old_mode = dc.SetBkMode(TRANSPARENT);
+  const auto settle_offset =
+      MulDiv(ScaleForDpi(dpi_, 10), 100 - reveal_progress_, 100);
+  auto text_rect = rect;
+  text_rect.left += ScaleForDpi(dpi_, 28);
+  text_rect.top += ScaleForDpi(dpi_, 22) + settle_offset;
+  text_rect.right = scan_button_rect_.left - ScaleForDpi(dpi_, 28);
+
+  auto label_rect = text_rect;
+  label_rect.bottom = label_rect.top + ScaleForDpi(dpi_, 20);
+  const auto old_font = dc.SelectFont(headline_font_);
+  auto old_color = dc.SetTextColor(BlendColor(kMutedInkColor, kAccentColor, 54));
+  dc.DrawText(L"UTILITY MAINTENANCE", -1, &label_rect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+  auto title_rect = text_rect;
+  title_rect.top = label_rect.bottom + ScaleForDpi(dpi_, 4);
+  title_rect.bottom = title_rect.top + ScaleForDpi(dpi_, 44);
+  dc.SelectFont(title_font_);
+  dc.SetTextColor(kInkColor);
+  dc.DrawText(L"Patch Cleaner", -1, &title_rect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+  auto body_rect = text_rect;
+  body_rect.top = title_rect.bottom + ScaleForDpi(dpi_, 8);
+  body_rect.bottom = body_rect.top + ScaleForDpi(dpi_, 40);
+  dc.SelectFont(body_font_);
+  dc.SetTextColor(kMutedInkColor);
+  dc.DrawText(
+      L"Review leftover Windows Installer packages before moving them to a "
+      L"secured temp folder or deleting them.",
+      -1, &body_rect, DT_LEFT | DT_WORDBREAK);
+
+  auto state_rect = text_rect;
+  state_rect.top = body_rect.bottom + ScaleForDpi(dpi_, 12);
+  state_rect.bottom = state_rect.top + ScaleForDpi(dpi_, 20);
+  dc.SelectFont(button_font_);
+  dc.SetTextColor(BlendColor(kInkColor, kAccentColor, scan_flash_ / 3));
+  auto state_line = BuildScanStateLine();
+  dc.DrawText(state_line, state_line.GetLength(), &state_rect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+  auto detail_rect = text_rect;
+  detail_rect.top = state_rect.bottom + ScaleForDpi(dpi_, 2);
+  detail_rect.bottom = detail_rect.top + ScaleForDpi(dpi_, 20);
+  dc.SelectFont(caption_font_);
+  dc.SetTextColor(BlendColor(kMutedInkColor, kInkColor, 18));
+  auto detail_line = BuildScanDetailLine();
+  dc.DrawText(detail_line, detail_line.GetLength(), &detail_rect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+  auto divider_rect = rect;
+  divider_rect.top = rect.bottom - 1;
+  FillRectColor(dc, divider_rect, kDividerColor);
+  DrawSurfaceButton(dc, scan_button_rect_, kButtonScan);
+
+  dc.SetTextColor(old_color);
+  dc.SetBkMode(old_mode);
+  dc.SelectFont(old_font);
+}
+
+void MainFrame::PaintListFrame(CDCHandle dc, const CRect& rect) const {
+  FillRectColor(dc, rect, kListFrameBackground);
+  DrawRectOutline(dc, rect, kPanelBorder);
+
+  auto top_band = rect;
+  top_band.bottom = rect.top + ScaleForDpi(dpi_, 3);
+  FillRectColor(dc, top_band,
+                BlendColor(kDividerColor, kAccentColor, 18 + scan_flash_ / 8));
+}
+
+void MainFrame::PaintActionRail(CDCHandle dc, const CRect& rect) const {
+  FillRectColor(dc, rect, kActionRailBackground);
+
+  auto top_rule = rect;
+  top_rule.bottom = rect.top + 1;
+  FillRectColor(dc, top_rule,
+                BlendColor(kDividerColor, kAccentColor, 16 + action_progress_ / 5));
+
+  const auto old_mode = dc.SetBkMode(TRANSPARENT);
+  const auto rail_padding = ScaleForDpi(dpi_, 24);
+  const auto left_width = std::max<int>(
+      ScaleForDpi(dpi_, 220),
+      static_cast<int>(select_all_button_rect_.left - rect.left -
+                       rail_padding * 2));
+  auto text_rect = rect;
+  text_rect.left += rail_padding;
+  text_rect.top += ScaleForDpi(dpi_, 18);
+  text_rect.right = text_rect.left + left_width;
+
+  const auto accent_flash =
+      std::max(std::max(selected_flash_, moved_flash_), deleted_flash_);
+  auto detail_target_color = kMutedInkColor;
+  if (deleted_flash_ >= moved_flash_ && deleted_flash_ >= scan_flash_ &&
+      deleted_flash_ > 0) {
+    detail_target_color = kDangerColor;
+  } else if (std::max(moved_flash_, scan_flash_) > 0) {
+    detail_target_color = kAccentColor;
+  }
+
+  const auto old_font = dc.SelectFont(button_font_);
+  auto old_color =
+      dc.SetTextColor(BlendColor(kInkColor, kAccentColor, selected_flash_ / 2));
+  auto state_rect = text_rect;
+  state_rect.bottom = state_rect.top + ScaleForDpi(dpi_, 22);
+  auto selection_line = BuildSelectionStateLine();
+  dc.DrawText(selection_line, selection_line.GetLength(), &state_rect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+  auto detail_rect = text_rect;
+  detail_rect.top = state_rect.bottom + ScaleForDpi(dpi_, 6) +
+                    MulDiv(ScaleForDpi(dpi_, 6), action_progress_, 100);
+  detail_rect.bottom = detail_rect.top + ScaleForDpi(dpi_, 20);
+  dc.SelectFont(caption_font_);
+  dc.SetTextColor(
+      BlendColor(kActionRailBackground, detail_target_color,
+                 std::max(18, accent_flash / 2 + action_progress_ / 3)));
+  auto detail_line = BuildSelectionDetailLine();
+  dc.DrawText(detail_line, detail_line.GetLength(), &detail_rect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+  DrawSurfaceButton(dc, select_all_button_rect_, kButtonSelectAll);
+  DrawSurfaceButton(dc, move_to_temp_button_rect_, kButtonMoveToTemp);
+  DrawSurfaceButton(dc, delete_button_rect_, kButtonDelete);
+
+  dc.SetTextColor(old_color);
+  dc.SetBkMode(old_mode);
+  dc.SelectFont(old_font);
+}
+
+LRESULT MainFrame::PaintHeaderCustomDraw(NMCUSTOMDRAW* draw) {
+  switch (draw->dwDrawStage) {
+    case CDDS_PREPAINT:
+      return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT: {
+      CDCHandle dc(draw->hdc);
+      CRect item_rect(draw->rc);
+      const auto item_index = static_cast<int>(draw->dwItemSpec);
+
+      auto fill_color =
+          item_index == sort_column_
+              ? BlendColor(kListFrameBackground, kAccentColor, 9)
+              : BlendColor(kListFrameBackground, kWindowBackground, 10);
+      FillRectColor(dc, item_rect, fill_color);
+
+      auto bottom_rule = item_rect;
+      bottom_rule.top = bottom_rule.bottom - 1;
+      FillRectColor(dc, bottom_rule, kDividerColor);
+
+      auto right_rule = item_rect;
+      right_rule.left = right_rule.right - 1;
+      FillRectColor(dc, right_rule, kDividerColor);
+
+      wchar_t buffer[64]{};
+      HDITEM item{};
+      item.mask = HDI_TEXT | HDI_FORMAT;
+      item.pszText = buffer;
+      item.cchTextMax = _countof(buffer);
+      Header_GetItem(draw->hdr.hwndFrom, item_index, &item);
+
+      auto text_rect = item_rect;
+      text_rect.DeflateRect(ScaleForDpi(dpi_, 12), 0);
+      if (item_index == sort_column_) {
+        const auto indicator_width = ScaleForDpi(dpi_, 18);
+        auto arrow_rect = item_rect;
+        arrow_rect.left =
+            arrow_rect.right - indicator_width - ScaleForDpi(dpi_, 8);
+        arrow_rect.right -= ScaleForDpi(dpi_, 6);
+        arrow_rect.top += ScaleForDpi(dpi_, 7);
+        arrow_rect.bottom -= ScaleForDpi(dpi_, 7);
+        DrawChevron(dc, arrow_rect, sort_ascending_,
+                    BlendColor(kInkColor, kAccentColor, 55));
+        text_rect.right = arrow_rect.left - ScaleForDpi(dpi_, 6);
+      }
+
+      const auto old_font = dc.SelectFont(button_font_);
+      const auto old_mode = dc.SetBkMode(TRANSPARENT);
+      const auto old_color = dc.SetTextColor(kMutedInkColor);
+      dc.DrawText(buffer, -1, &text_rect,
+                  DT_SINGLELINE | DT_VCENTER |
+                      ((item.fmt & HDF_RIGHT) != 0 ? DT_RIGHT : DT_LEFT));
+      dc.SetTextColor(old_color);
+      dc.SetBkMode(old_mode);
+      dc.SelectFont(old_font);
+      return CDRF_SKIPDEFAULT;
+    }
+  }
+
+  return CDRF_DODEFAULT;
+}
+
+LRESULT MainFrame::PaintListCustomDraw(NMLVCUSTOMDRAW* draw) {
+  switch (draw->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+      return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT:
+      return CDRF_NOTIFYSUBITEMDRAW;
+    case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+      const auto item_index = static_cast<int>(draw->nmcd.dwItemSpec);
+      const auto selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+      const auto checked =
+          item_index >= 0 && file_list_.GetCheckState(item_index) != FALSE;
+
+      COLORREF background = (item_index % 2) == 0 ? kListFrameBackground
+                                                  : kListStripeColor;
+      if (checked) {
+        background = BlendColor(background, kAccentColor, 5);
+      }
+      if (selected) {
+        background = kListSelectedColor;
+      }
+
+      draw->clrTextBk = background;
+      draw->clrText = kInkColor;
+      return CDRF_DODEFAULT;
+    }
+  }
+
+  return CDRF_DODEFAULT;
+}
+
+CString MainFrame::BuildScanStateLine() const {
+  if (!has_last_scan_) {
+    return CString(L"Ready to scan the Windows Installer cache.");
+  }
+
+  CString state_line;
+  if (last_scan_succeeded_) {
+    state_line.Format(L"Last scan %s | %d reclaimable file%s",
+                      static_cast<LPCWSTR>(FormatClockTime(last_scan_time_)),
+                      total_reclaimable_count_,
+                      total_reclaimable_count_ == 1 ? L"" : L"s");
+  } else {
+    state_line.Format(L"Last scan %s | scan could not complete safely",
+                      static_cast<LPCWSTR>(FormatClockTime(last_scan_time_)));
+  }
+
+  return state_line;
+}
+
+CString MainFrame::BuildScanDetailLine() const {
+  if (!has_last_scan_) {
+    return CString(
+        L"Scan reviews MSI and MSP leftovers in the Windows Installer cache.");
+  }
+
+  if (!last_scan_succeeded_) {
+    return CString(
+        L"No files were listed because the scan could not complete safely.");
+  }
+
+  CString detail_line;
+  detail_line.Format(L"%s reclaimable across the current scan.",
+                     static_cast<LPCWSTR>(
+                         FormatSizeString(total_reclaimable_size_)));
+  return detail_line;
+}
+
+CString MainFrame::BuildSelectionStateLine() const {
+  CString state_line;
+  if (selected_count_ > 0) {
+    state_line.Format(L"Selected %d file%s | %s chosen", selected_count_,
+                      selected_count_ == 1 ? L"" : L"s",
+                      static_cast<LPCWSTR>(FormatSizeString(selected_size_)));
+  } else {
+    state_line = L"Selected 0 files | choose installers to enable actions";
+  }
+
+  return state_line;
+}
+
+CString MainFrame::BuildSelectionDetailLine() const {
+  CString detail_line;
+  detail_line.Format(L"Moved %s | Deleted %s | Temp destination %s",
+                     static_cast<LPCWSTR>(FormatSizeString(moved_size_)),
+                     static_cast<LPCWSTR>(FormatSizeString(deleted_size_)),
+                     kTempMoveDirectory);
+  return detail_line;
+}
+
+LRESULT MainFrame::OnCustomDraw(NMHDR* header) {
+  if (header->hwndFrom == file_list_.m_hWnd) {
+    return PaintListCustomDraw(reinterpret_cast<NMLVCUSTOMDRAW*>(header));
+  }
+
+  CHeaderCtrl list_header(file_list_.GetHeader());
+  if (list_header.IsWindow() && header->hwndFrom == list_header.m_hWnd) {
+    return PaintHeaderCustomDraw(reinterpret_cast<NMCUSTOMDRAW*>(header));
+  }
+
+  SetMsgHandled(FALSE);
+  return 0;
+}
+
+LRESULT MainFrame::OnDpiChanged(UINT /*message*/, WPARAM w_param, LPARAM l_param,
+                                BOOL& handled) {
+  handled = TRUE;
+  dpi_ = HIWORD(w_param);
+  RebuildFonts();
+  SyncListAppearance();
+
+  const auto* suggested_rect = reinterpret_cast<const RECT*>(l_param);
+  SetWindowPos(nullptr, suggested_rect->left, suggested_rect->top,
+               suggested_rect->right - suggested_rect->left,
+               suggested_rect->bottom - suggested_rect->top,
+               SWP_NOACTIVATE | SWP_NOZORDER);
+
+  LayoutChildren();
+  Invalidate(FALSE);
+  return 0;
 }
 
 int CALLBACK MainFrame::CompareFileItems(LPARAM left, LPARAM right,

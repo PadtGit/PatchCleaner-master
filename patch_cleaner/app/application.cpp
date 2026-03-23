@@ -46,7 +46,7 @@ HRESULT Application::PreMessageLoop(int show_mode) throw() {
     return S_FALSE;
   }
 
-  frame_->ResizeClient(620, 320, FALSE);
+  frame_->ResizeClient(980, 680, FALSE);
   frame_->CenterWindow();
   frame_->ShowWindow(show_mode);
   frame_->UpdateWindow();
