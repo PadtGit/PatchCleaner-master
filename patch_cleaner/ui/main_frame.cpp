@@ -1168,11 +1168,15 @@ bool MoveInstallerCacheFile(const std::wstring& path,
   std::wstring destination_name;
   if (!BuildUniqueMoveName(destination_directory, path, batch_token,
                            &destination_name)) {
+    RestoreFileAttributesIfNeeded(file_handle, original_info,
+                                  attributes_changed);
     return false;
   }
 
   std::wstring final_source_path;
   if (!GetPathFromHandle(file_handle, &final_source_path)) {
+    RestoreFileAttributesIfNeeded(file_handle, original_info,
+                                  attributes_changed);
     return false;
   }
 

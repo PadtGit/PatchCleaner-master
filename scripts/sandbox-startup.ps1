@@ -7,6 +7,9 @@ param(
 
   [string]$SessionId = (Get-Date -Format "yyyyMMdd-HHmmss"),
 
+  [ValidateRange(1, 2048)]
+  [int]$FillerCount = 64,
+
   [switch]$SeedInitialOnly,
 
   [switch]$SeedDeleteOnly
@@ -19,7 +22,7 @@ $script:TempMoveDirectory = "C:\TempPatchCleanerFiles"
 $script:MoveTargetName = "PatchCleaner-Sandbox-Move.msi"
 $script:CollisionTargetName = "PatchCleaner-Sandbox-Collision.msi"
 $script:LateDeleteTargetName = "PatchCleaner-Sandbox-Delete.msp"
-$script:FillerCount = 64
+$script:FillerCount = $FillerCount
 $script:SessionLogPath = $null
 $script:SeedManifestPath = $null
 $script:SummaryPath = $null
@@ -101,6 +104,10 @@ function Get-InitialSeedDefinitions {
   return $definitions
 }
 
+function Get-ExpectedInitialItemCount {
+  return (Get-InitialSeedDefinitions).Count
+}
+
 function Write-SeedManifest {
   param(
     [Parameter(Mandatory = $true)]
@@ -177,6 +184,7 @@ function Invoke-ElevatedSeeder {
     "-BundleRoot", "`"$BundleRoot`"",
     "-ResultsRoot", "`"$ResultsRoot`"",
     "-SessionId", $SessionId,
+    "-FillerCount", $script:FillerCount,
     $switchName
   )
 
@@ -240,15 +248,48 @@ function Write-Checklist {
   Set-Content -LiteralPath $script:ChecklistPath -Value $lines -Encoding UTF8
 }
 
+function Open-Checklist {
+  $notepadPath = Join-Path $env:windir "System32\notepad.exe"
+  if (-not (Test-Path $notepadPath)) {
+    Write-SessionLog "Notepad is unavailable; continuing without opening the checklist automatically."
+    return
+  }
+
+  try {
+    Start-Process -FilePath $notepadPath -ArgumentList "`"$script:ChecklistPath`"" | Out-Null
+  } catch {
+    Write-SessionLog ("Could not open the checklist automatically: {0}" -f $_.Exception.Message)
+  }
+}
+
 function Wait-ForTester {
   param(
     [Parameter(Mandatory = $true)]
     [string]$Prompt
   )
 
+  if (-not [Environment]::UserInteractive) {
+    Write-SessionLog "Manual tester prompt skipped because the session is non-interactive: $Prompt"
+    return
+  }
+
   Write-Host ""
   Write-Host $Prompt
-  [void](Read-Host "Press Enter when ready")
+  [void](Read-OptionalHostInput -Prompt "Press Enter when ready")
+}
+
+function Read-OptionalHostInput {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Prompt
+  )
+
+  try {
+    return Read-Host $Prompt
+  } catch {
+    Write-SessionLog ("Host input is unavailable for prompt '{0}': {1}" -f $Prompt, $_.Exception.Message)
+    return $null
+  }
 }
 
 function Read-YesNo {
@@ -257,8 +298,19 @@ function Read-YesNo {
     [string]$Prompt
   )
 
+  if (-not [Environment]::UserInteractive) {
+    Write-SessionLog "Manual yes/no prompt skipped because the session is non-interactive: $Prompt"
+    return $false
+  }
+
   for (;;) {
-    $response = (Read-Host "$Prompt [y/n]").Trim().ToLowerInvariant()
+    $responseText = Read-OptionalHostInput -Prompt "$Prompt [y/n]"
+    if ($null -eq $responseText) {
+      Write-SessionLog "Manual yes/no response was unavailable; recording '$Prompt' as not confirmed."
+      return $false
+    }
+
+    $response = $responseText.Trim().ToLowerInvariant()
     if ($response -eq "y" -or $response -eq "yes") {
       return $true
     }
@@ -329,6 +381,7 @@ function Invoke-AutomationDriver {
     return $null
   }
 
+  $timedOut = $false
   $resultPath = Get-AutomationResultPath -Phase $Phase
   if (Test-Path $resultPath) {
     Remove-Item -LiteralPath $resultPath -Force
@@ -344,7 +397,7 @@ function Invoke-AutomationDriver {
     "`"$script:MoveTargetName`"",
     "`"$script:CollisionTargetName`"",
     "`"$script:LateDeleteTargetName`"",
-    66
+    (Get-ExpectedInitialItemCount)
   )
 
   Write-SessionLog "Starting AutoHotkey automation for phase '$Phase'."
@@ -353,6 +406,7 @@ function Invoke-AutomationDriver {
                            -PassThru
 
   if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    $timedOut = $true
     try {
       $process.Kill()
     } catch {
@@ -360,14 +414,21 @@ function Invoke-AutomationDriver {
     Write-SessionLog "Automation for phase '$Phase' timed out."
   }
 
+  $exitCode = if ($process.HasExited) { [string]$process.ExitCode } elseif ($timedOut) { "timed_out" } else { "running" }
   if (-not (Test-Path $resultPath)) {
-    Write-SessionLog "Automation for phase '$Phase' did not produce a results file."
-    return $null
+    $note = if ($timedOut) { "automation_timed_out_without_results" } else { "automation_result_missing" }
+    Write-SessionLog "Automation for phase '$Phase' did not produce a results file; recording a synthetic failure result."
+    return @{
+      phase = $Phase
+      status = "revise"
+      exit_code = $exitCode
+      note = $note
+    }
   }
 
   $result = ConvertFrom-KeyValueFile -Path $resultPath
   $result["phase"] = $Phase
-  $result["exit_code"] = if ($process.HasExited) { [string]$process.ExitCode } else { "timed_out" }
+  $result["exit_code"] = $exitCode
   return $result
 }
 
@@ -400,6 +461,49 @@ function Add-CheckResult {
 
   $script:CheckResults += [pscustomobject]$result
   Write-SessionLog ("Check '{0}' => {1}. {2}" -f $Name, $(if ($passed) { "PASS" } else { "FAIL" }), $Details)
+}
+
+function Write-SandboxSummary {
+  param(
+    [bool]$Passed,
+
+    [AllowNull()]
+    [string]$Notes = $null,
+
+    [AllowNull()]
+    [string]$FailureMessage = $null
+  )
+
+  if ([string]::IsNullOrWhiteSpace($script:SummaryPath)) {
+    return
+  }
+
+  $expectedInitialItems = $null
+  if (-not [string]::IsNullOrWhiteSpace($script:SeedManifestPath) -and (Test-Path $script:SeedManifestPath)) {
+    try {
+      $seedManifest = Get-SeedManifest
+      $expectedInitialItems = $seedManifest.initial_files.Count
+    } catch {
+      Write-SessionLog ("Could not load the seed manifest while writing the summary: {0}" -f $_.Exception.Message)
+    }
+  }
+
+  $summary = [ordered]@{
+    session_id = $SessionId
+    completed_at = (Get-Date).ToString("o")
+    bundle_root = $BundleRoot
+    results_root = $ResultsRoot
+    filler_count = $script:FillerCount
+    expected_initial_items = $expectedInitialItems
+    checklist_path = $script:ChecklistPath
+    passed = $Passed
+    checks = $script:CheckResults
+    notes = $Notes
+    failure_message = $FailureMessage
+  }
+
+  $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:SummaryPath -Encoding UTF8
+  Write-SessionLog "Wrote sandbox summary to $($script:SummaryPath)"
 }
 
 function Test-MoveOutcome {
@@ -485,7 +589,7 @@ try {
 
   $seedManifest = Get-SeedManifest
   Write-Checklist -SeedManifest $seedManifest
-  Start-Process -FilePath "notepad.exe" -ArgumentList "`"$script:ChecklistPath`"" | Out-Null
+  Open-Checklist
 
   Start-PatchCleaner
 
@@ -592,25 +696,18 @@ try {
                     -Details $deleteOutcome.details
   }
 
-  $notes = Read-Host "Optional notes for the sandbox results log (press Enter to skip)"
+  $notes = if ([Environment]::UserInteractive) {
+    Read-OptionalHostInput -Prompt "Optional notes for the sandbox results log (press Enter to skip)"
+  } else {
+    Write-SessionLog "Skipping optional notes prompt because the session is non-interactive."
+    $null
+  }
   if (-not [string]::IsNullOrWhiteSpace($notes)) {
     Write-SessionLog "Tester notes: $notes"
   }
 
   $allPassed = ($script:CheckResults | Where-Object { -not $_.passed }).Count -eq 0
-  $summary = [ordered]@{
-    session_id = $SessionId
-    completed_at = (Get-Date).ToString("o")
-    bundle_root = $BundleRoot
-    results_root = $ResultsRoot
-    checklist_path = $script:ChecklistPath
-    passed = $allPassed
-    checks = $script:CheckResults
-    notes = $notes
-  }
-  $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:SummaryPath -Encoding UTF8
-
-  Write-SessionLog "Wrote sandbox summary to $($script:SummaryPath)"
+  Write-SandboxSummary -Passed $allPassed -Notes $notes
   if ($allPassed) {
     Write-SessionLog "Sandbox validation completed successfully."
     exit 0
@@ -620,11 +717,15 @@ try {
   exit 1
 } catch {
   if ($script:SessionLogPath) {
-    Write-SessionLog ("Sandbox validation failed: {0}" -f $_.Exception.Message)
+    $failureMessage = $_.Exception.Message
+    Write-SessionLog ("Sandbox validation failed: {0}" -f $failureMessage)
+    Write-SandboxSummary -Passed $false -FailureMessage $failureMessage
   } else {
     Write-Host $_.Exception.Message
   }
 
-  [void](Read-Host "Press Enter to close this window")
+  if ([Environment]::UserInteractive) {
+    [void](Read-OptionalHostInput -Prompt "Press Enter to close this window")
+  }
   exit 1
 }

@@ -1,6 +1,9 @@
 param(
   [string]$OutputRoot = (Join-Path ([System.IO.Path]::GetTempPath()) "PatchCleanerSandbox"),
 
+  [ValidateRange(1, 2048)]
+  [int]$FillerCount = 64,
+
   [switch]$EnableLogonCommand,
 
   [switch]$Launch
@@ -117,7 +120,7 @@ $logonWrapperContent = @"
 @echo off
 setlocal
 echo [%DATE% %TIME%] sandbox-logon.cmd started> "$sandboxLogPath"
-"$sandboxPowerShell" -NoLogo -ExecutionPolicy Bypass -File "$startupSandboxPath" -BundleRoot "$bundleSandboxPath" -ResultsRoot "$resultsSandboxPath" >> "$sandboxLogPath" 2>&1
+"$sandboxPowerShell" -NoLogo -ExecutionPolicy Bypass -File "$startupSandboxPath" -BundleRoot "$bundleSandboxPath" -ResultsRoot "$resultsSandboxPath" -FillerCount $FillerCount >> "$sandboxLogPath" 2>&1
 echo [%DATE% %TIME%] sandbox-logon.cmd exit code %ERRORLEVEL%>> "$sandboxLogPath"
 exit /b %ERRORLEVEL%
 "@
@@ -127,7 +130,7 @@ $desktopLauncherContent = @"
 @echo off
 setlocal
 echo [%DATE% %TIME%] Run PatchCleaner Sandbox.cmd started>> "$desktopLauncherLogPath"
-"$sandboxPowerShell" -NoLogo -ExecutionPolicy Bypass -File "$startupSandboxPath" -BundleRoot "$bundleSandboxPath" -ResultsRoot "$resultsSandboxPath" >> "$desktopLauncherLogPath" 2>&1
+"$sandboxPowerShell" -NoLogo -ExecutionPolicy Bypass -File "$startupSandboxPath" -BundleRoot "$bundleSandboxPath" -ResultsRoot "$resultsSandboxPath" -FillerCount $FillerCount >> "$desktopLauncherLogPath" 2>&1
 echo [%DATE% %TIME%] Run PatchCleaner Sandbox.cmd exit code %ERRORLEVEL%>> "$desktopLauncherLogPath"
 exit /b %ERRORLEVEL%
 "@
@@ -193,6 +196,8 @@ $manifest = [ordered]@{
   results_root = $resultsRoot
   wsb_path = $wsbPath
   runtime_dlls = $runtimeDlls
+  filler_count = $FillerCount
+  expected_initial_items = $FillerCount + 2
   bundle_files = @((Get-ChildItem -LiteralPath $bundleRoot -File).Name)
   desktop_files = @((Get-ChildItem -LiteralPath $desktopRoot -File).Name)
   desktop_launcher = $desktopLauncherSandboxPath
