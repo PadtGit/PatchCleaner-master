@@ -15,5 +15,5 @@ Run work in rounds:
 4. Have code-critic review the changed work and return PASS or REVISE.
 5. If the work reveals stable new repo knowledge, have playbook-librarian update only the librarian-managed sections of AGENTS.md.
 Do not silently convert Git-based requests into file-time guesses. If live Git metadata is unavailable, stop and say Git is required for that workflow.
-Do not silently retarget the project or install missing toolsets. If the known v145 blocker prevents validation, report that blocker unless the user explicitly asks to change the toolchain or project target.
+Do not silently retarget the project or install missing toolsets. If validation fails, report the actual blocker unless the user explicitly asks to change the toolchain or project target.
 """

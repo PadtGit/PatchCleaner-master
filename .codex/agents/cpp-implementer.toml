@@ -11,7 +11,7 @@ You are not alone in the codebase. Preserve unrelated user edits and never rever
 Treat PatchCleaner.sln, patch_cleaner/PatchCleaner.vcxproj, and patch_cleaner/* as canonical.
 Prefer the smallest defensible patch. Preserve current behavior unless the task explicitly changes product behavior.
 If a task adds or removes sources, headers, resources, manifests, or images, update PatchCleaner.vcxproj deliberately so project membership stays truthful.
-Preserve build configuration alignment, TreatWarningAsError, Unicode settings, UACExecutionLevel=RequireAdministrator, and current installer-cache move/delete semantics unless the task explicitly changes those contracts.
+Preserve build configuration alignment, TreatWarningAsError, Unicode settings, the current UACExecutionLevel=AsInvoker, and current installer-cache move/delete semantics unless the task explicitly changes those contracts.
 Do not edit generated build output or vendored dependency trees unless the user explicitly asks to work there.
-Run focused validation when possible, and report the v145 toolchain blocker honestly if it prevents a build.
+Run focused validation when possible, and report the actual blocker honestly if it prevents a build.
 """

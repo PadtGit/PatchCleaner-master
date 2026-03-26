@@ -22,8 +22,8 @@ Maintain this repo with a staged workflow that starts from the canonical PatchCl
 
 - Map the exact source, project, and resource files before editing.
 - Update canonical source files first and touch `PatchCleaner.vcxproj` only when file membership changes require it.
-- Preserve build configuration alignment, `TreatWarningAsError`, Unicode, `UACExecutionLevel=RequireAdministrator`, and current installer-cache move/delete behavior unless the task explicitly changes them.
-- Validate with the MSBuild commands from `AGENTS.md` when possible. If the known `v145` blocker prevents a build, report it clearly instead of guessing.
+- Preserve build configuration alignment, `TreatWarningAsError`, Unicode, the current `UACExecutionLevel=AsInvoker`, and current installer-cache move/delete behavior unless the task explicitly changes them.
+- Validate with the MSBuild commands from `AGENTS.md` when possible. If validation fails, report the actual blocker clearly instead of guessing.
 
 ### Round 2: Code-Quality Review
 
@@ -32,7 +32,13 @@ Maintain this repo with a staged workflow that starts from the canonical PatchCl
 - Treat correctness, behavior regressions, UI impact, project/resource drift, platform divergence, and broken validation as blockers.
 - If the critic returns `REVISE`, fix only the concrete issues with behavioral or maintenance impact, then rerun focused validation.
 
-### Round 3: Change Analysis
+### Round 3: Windows Sandbox Validation
+
+- Use this round only after host builds are green and the critic returns `PASS`.
+- Skip docs-only, playbook-only, or low-risk tooling-only work.
+- Use `scripts/prepare-sandbox-bundle.ps1` and `scripts/sandbox-startup.ps1` for release candidates, scan/move/delete/elevation/UI-responsiveness changes, or when the user explicitly requests sandbox coverage.
+
+### Round 4: Change Analysis
 
 - Only do recent-commit or last-N-days analysis when this workspace has live Git metadata.
 - Do not substitute file timestamps for commit windows.
@@ -50,4 +56,4 @@ Maintain this repo with a staged workflow that starts from the canonical PatchCl
 
 - Summaries should state the files changed, the validation command or check run, the critic result, and any new durable playbook note.
 - If no stable repo knowledge was discovered, do not force an `AGENTS.md` edit.
-- Do not promise Git-backed history analysis or successful builds while this workspace lacks live Git metadata and the local environment still lacks the `v145` build tools.
+- Do not promise Git-backed history analysis, successful builds, or a green sandbox run when the required Git metadata, toolchain, or in-sandbox validation is unavailable.
