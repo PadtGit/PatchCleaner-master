@@ -7,14 +7,18 @@
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <msi.h>
+#include <msidefs.h>
+#include <msiquery.h>
 #include <sddl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <array>
 #include <map>
 #include <cstring>
+#include <cwctype>
 #include <memory>
 #include <string>
 #include <vector>
@@ -53,6 +57,12 @@ struct MutationReply {
   std::vector<std::wstring> failed_paths;
 };
 
+struct AppSettings {
+  bool deep_scan_enabled = true;
+  bool missing_files_check_on_startup = false;
+  std::vector<std::wstring> exclusion_filters;
+};
+
 struct LocalMemDeleter {
   void operator()(void* value) const {
     if (value != nullptr) {
@@ -64,6 +74,7 @@ struct LocalMemDeleter {
 bool BuildSecureDirectoryAttributes(
     SECURITY_ATTRIBUTES* attributes,
     std::unique_ptr<void, LocalMemDeleter>* descriptor_holder);
+bool EnsureDirectoryChainExists(const std::wstring& path);
 bool GetExecutablePath(std::wstring* executable_path);
 bool OpenValidatedDirectory(const std::wstring& path, DWORD desired_access,
                             CHandle* directory_handle);
@@ -71,9 +82,17 @@ bool OpenValidatedDirectory(const std::wstring& path, DWORD desired_access,
 constexpr wchar_t kAllUsersSid[] = L"s-1-1-0";
 constexpr wchar_t kTempMoveDirectory[] = L"C:\\TempPatchCleanerFiles";
 constexpr wchar_t kOperationArgument[] = L"--elevated-operation";
+constexpr wchar_t kAppDataRootSuffix[] = L"\\PatchCleaner";
 constexpr wchar_t kOperationRootSuffix[] = L"\\PatchCleaner\\Operations";
+constexpr wchar_t kSettingsFileName[] = L"settings.ini";
+constexpr wchar_t kShareMetricsFileName[] = L"share_metrics.tsv";
+constexpr wchar_t kShareProductUrl[] =
+    L"https://github.com/PadtGit/PatchCleaner-master";
 constexpr wchar_t kOperationMoveToken[] = L"move";
 constexpr wchar_t kOperationDeleteToken[] = L"delete";
+constexpr wchar_t kShareEventClicked[] = L"share_summary_clicked";
+constexpr wchar_t kShareEventCopied[] = L"share_summary_copied";
+constexpr wchar_t kShareEventCopyFailed[] = L"share_summary_copy_failed";
 constexpr wchar_t kResultSuccessPrefix[] = L"ok\t";
 constexpr wchar_t kResultFailurePrefix[] = L"fail\t";
 constexpr wchar_t kResultDestinationError[] = L"destination_error";
@@ -83,6 +102,7 @@ constexpr wchar_t kSecureSubdirectorySddl[] =
 constexpr size_t kMaxFailureSamples = 5;
 constexpr UINT kDefaultDpi = 96;
 constexpr DWORD kResponsivePumpStride = 32;
+constexpr ULONGLONG kShareFeedbackDurationMs = 4000;
 
 COLORREF BlendColor(COLORREF from, COLORREF to, int percent) {
   percent = std::max(0, std::min(100, percent));
@@ -392,6 +412,40 @@ bool GetOperationDirectory(std::wstring* operation_directory) {
   return NormalizePath(path, operation_directory);
 }
 
+bool GetAppDataDirectory(std::wstring* app_data_directory) {
+  std::wstring path;
+  if (!GetKnownFolderSubdirectory(FOLDERID_LocalAppData, kAppDataRootSuffix,
+                                  &path)) {
+    return false;
+  }
+
+  return NormalizePath(path, app_data_directory);
+}
+
+bool GetShareMetricsPath(std::wstring* metrics_path) {
+  std::wstring app_data_directory;
+  if (!GetAppDataDirectory(&app_data_directory) ||
+      !EnsureDirectoryChainExists(app_data_directory)) {
+    return false;
+  }
+
+  metrics_path->assign(app_data_directory);
+  metrics_path->append(L"\\").append(kShareMetricsFileName);
+  return true;
+}
+
+bool GetSettingsPath(std::wstring* settings_path) {
+  std::wstring app_data_directory;
+  if (!GetAppDataDirectory(&app_data_directory) ||
+      !EnsureDirectoryChainExists(app_data_directory)) {
+    return false;
+  }
+
+  settings_path->assign(app_data_directory);
+  settings_path->append(L"\\").append(kSettingsFileName);
+  return true;
+}
+
 bool EnsureDirectoryChainExists(const std::wstring& path) {
   const auto result = SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
   return result == ERROR_SUCCESS || result == ERROR_FILE_EXISTS ||
@@ -440,6 +494,156 @@ bool WriteWideLinesFile(const std::wstring& path,
              FALSE &&
          written == size_in_bytes &&
          FlushFileBuffers(file) != FALSE;
+}
+
+bool AppendUtf8LineFile(const std::wstring& path, const std::wstring& line) {
+  CHandle file(CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr));
+  if (file == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  std::wstring content(line);
+  content.append(L"\r\n");
+
+  const auto bytes_required = WideCharToMultiByte(
+      CP_UTF8, 0, content.c_str(), static_cast<int>(content.size()), nullptr, 0,
+      nullptr, nullptr);
+  if (bytes_required <= 0) {
+    return false;
+  }
+
+  std::vector<char> buffer(bytes_required);
+  if (WideCharToMultiByte(CP_UTF8, 0, content.c_str(),
+                          static_cast<int>(content.size()), buffer.data(),
+                          static_cast<int>(buffer.size()), nullptr,
+                          nullptr) != bytes_required) {
+    return false;
+  }
+
+  DWORD written = 0;
+  return WriteFile(file, buffer.data(), static_cast<DWORD>(buffer.size()),
+                   &written, nullptr) != FALSE &&
+         written == static_cast<DWORD>(buffer.size()) &&
+         FlushFileBuffers(file) != FALSE;
+}
+
+std::wstring TrimWhitespace(const std::wstring& value) {
+  auto begin = value.begin();
+  while (begin != value.end() && iswspace(*begin)) {
+    ++begin;
+  }
+
+  auto end = value.end();
+  while (end != begin && iswspace(*(end - 1))) {
+    --end;
+  }
+
+  return std::wstring(begin, end);
+}
+
+std::wstring ToLowerCopy(const std::wstring& value) {
+  std::wstring lowered(value);
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+  return lowered;
+}
+
+bool ContainsStringIgnoreCase(const std::wstring& haystack,
+                              const std::wstring& needle) {
+  if (needle.empty()) {
+    return false;
+  }
+
+  const auto lowered_haystack = ToLowerCopy(haystack);
+  const auto lowered_needle = ToLowerCopy(needle);
+  return lowered_haystack.find(lowered_needle) != std::wstring::npos;
+}
+
+bool ContainsFilterValue(const std::vector<std::wstring>& filters,
+                         const std::wstring& candidate) {
+  const auto normalized_candidate = ToLowerCopy(TrimWhitespace(candidate));
+  return std::find_if(filters.begin(), filters.end(),
+                      [&](const std::wstring& filter) {
+                        return ToLowerCopy(filter) == normalized_candidate;
+                      }) != filters.end();
+}
+
+bool LoadAppSettings(AppSettings* settings) {
+  std::wstring settings_path;
+  if (settings == nullptr || !GetSettingsPath(&settings_path)) {
+    return false;
+  }
+
+  settings->deep_scan_enabled =
+      GetPrivateProfileIntW(L"Settings", L"DeepScanEnabled", 1,
+                            settings_path.c_str()) != 0;
+  settings->missing_files_check_on_startup =
+      GetPrivateProfileIntW(L"Settings", L"MissingFilesCheckOnStartup", 0,
+                            settings_path.c_str()) != 0;
+
+  const auto filter_count = static_cast<int>(
+      GetPrivateProfileIntW(L"ExclusionFilters", L"Count", 0,
+                            settings_path.c_str()));
+  settings->exclusion_filters.clear();
+  for (auto index = 0; index < filter_count; ++index) {
+    wchar_t key_name[32]{};
+    swprintf_s(key_name, L"Filter%d", index);
+
+    wchar_t buffer[512]{};
+    GetPrivateProfileStringW(L"ExclusionFilters", key_name, L"", buffer,
+                             _countof(buffer), settings_path.c_str());
+    const auto filter_value = TrimWhitespace(buffer);
+    if (!filter_value.empty() &&
+        !ContainsFilterValue(settings->exclusion_filters, filter_value)) {
+      settings->exclusion_filters.push_back(filter_value);
+    }
+  }
+
+  return true;
+}
+
+bool SaveAppSettings(const AppSettings& settings) {
+  std::wstring settings_path;
+  if (!GetSettingsPath(&settings_path)) {
+    return false;
+  }
+
+  if (!WritePrivateProfileStringW(
+          L"Settings", L"DeepScanEnabled",
+          settings.deep_scan_enabled ? L"1" : L"0", settings_path.c_str()) ||
+      !WritePrivateProfileStringW(
+          L"Settings", L"MissingFilesCheckOnStartup",
+          settings.missing_files_check_on_startup ? L"1" : L"0",
+          settings_path.c_str())) {
+    return false;
+  }
+
+  if (!WritePrivateProfileSectionW(L"ExclusionFilters", L"\0\0",
+                                   settings_path.c_str())) {
+    return false;
+  }
+
+  wchar_t count_buffer[32]{};
+  swprintf_s(count_buffer, L"%u",
+             static_cast<unsigned int>(settings.exclusion_filters.size()));
+  if (!WritePrivateProfileStringW(L"ExclusionFilters", L"Count", count_buffer,
+                                  settings_path.c_str())) {
+    return false;
+  }
+
+  for (size_t index = 0; index < settings.exclusion_filters.size(); ++index) {
+    wchar_t key_name[32]{};
+    swprintf_s(key_name, L"Filter%u", static_cast<unsigned int>(index));
+    if (!WritePrivateProfileStringW(L"ExclusionFilters", key_name,
+                                    settings.exclusion_filters[index].c_str(),
+                                    settings_path.c_str())) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool ReadWideLinesFile(const std::wstring& path,
@@ -496,6 +700,872 @@ bool ReadWideLinesFile(const std::wstring& path,
   }
 
   return true;
+}
+
+std::wstring BuildIsoTimestampUtc() {
+  SYSTEMTIME now{};
+  GetSystemTime(&now);
+
+  wchar_t buffer[32]{};
+  swprintf_s(buffer, L"%04u-%02u-%02uT%02u:%02u:%02uZ", now.wYear, now.wMonth,
+             now.wDay, now.wHour, now.wMinute, now.wSecond);
+  return std::wstring(buffer);
+}
+
+void TrackShareMetric(const wchar_t* event_name, int reclaimable_count,
+                      uint64_t reclaimable_size, int selected_count,
+                      uint64_t selected_size, bool last_scan_succeeded) {
+  std::wstring metrics_path;
+  if (!GetShareMetricsPath(&metrics_path)) {
+    return;
+  }
+
+  CString line;
+  line.Format(L"%s\t%s\t%d\t%I64u\t%d\t%I64u\t%d", BuildIsoTimestampUtc().c_str(),
+              event_name, reclaimable_count,
+              static_cast<unsigned long long>(reclaimable_size), selected_count,
+              static_cast<unsigned long long>(selected_size),
+              last_scan_succeeded ? 1 : 0);
+  AppendUtf8LineFile(metrics_path, std::wstring(line.GetString()));
+}
+
+bool CopyTextToClipboard(HWND owner_window, const std::wstring& text) {
+  if (!OpenClipboard(owner_window)) {
+    return false;
+  }
+
+  const auto close_clipboard = [&]() { CloseClipboard(); };
+  if (!EmptyClipboard()) {
+    close_clipboard();
+    return false;
+  }
+
+  const auto bytes =
+      static_cast<SIZE_T>((text.size() + 1) * sizeof(wchar_t));
+  HGLOBAL global_handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+  if (global_handle == nullptr) {
+    close_clipboard();
+    return false;
+  }
+
+  void* global_data = GlobalLock(global_handle);
+  if (global_data == nullptr) {
+    GlobalFree(global_handle);
+    close_clipboard();
+    return false;
+  }
+
+  memcpy(global_data, text.c_str(), bytes);
+  GlobalUnlock(global_handle);
+
+  if (SetClipboardData(CF_UNICODETEXT, global_handle) == nullptr) {
+    GlobalFree(global_handle);
+    close_clipboard();
+    return false;
+  }
+
+  close_clipboard();
+  return true;
+}
+
+constexpr int kSettingsDialogWidth = 584;
+constexpr int kSettingsDialogHeight = 488;
+constexpr COLORREF kSettingsDialogBackground = RGB(243, 238, 232);
+constexpr COLORREF kSettingsDialogPanelBackground = RGB(249, 246, 241);
+constexpr COLORREF kSettingsDialogInputBackground = RGB(255, 253, 250);
+constexpr COLORREF kSettingsDialogFooterBackground = RGB(247, 243, 238);
+constexpr COLORREF kSettingsDialogText = RGB(38, 34, 30);
+constexpr COLORREF kSettingsDialogMutedText = RGB(111, 99, 87);
+constexpr COLORREF kSettingsDialogAccent = RGB(173, 110, 66);
+constexpr COLORREF kSettingsDialogAccentDark = RGB(144, 90, 55);
+constexpr COLORREF kSettingsDialogDanger = RGB(145, 67, 58);
+constexpr COLORREF kSettingsDialogBorder = RGB(219, 209, 198);
+constexpr COLORREF kSettingsDialogDivider = RGB(227, 218, 208);
+constexpr COLORREF kSettingsDialogDisabledText = RGB(155, 145, 137);
+constexpr COLORREF kSettingsDialogButtonTextOnAccent = RGB(252, 248, 242);
+
+class SettingsDialog : public CWindowImpl<SettingsDialog> {
+ public:
+  DECLARE_WND_CLASS(L"PatchCleanerSettingsWindow")
+
+  explicit SettingsDialog(const AppSettings& settings)
+      : settings_(settings),
+        modal_result_(0),
+        dpi_(kDefaultDpi),
+        deep_scan_enabled_selection_(settings.deep_scan_enabled) {}
+
+  int DoModal(HWND owner_window) {
+    dpi_ = GetWindowDpi(owner_window);
+
+    RECT bounds{0, 0, ScaleForDpi(dpi_, kSettingsDialogWidth),
+                ScaleForDpi(dpi_, kSettingsDialogHeight)};
+    AdjustWindowRectEx(&bounds, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE,
+                       WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT);
+
+    if (Create(owner_window, bounds, L"PatchCleaner - Settings",
+               WS_POPUP | WS_CAPTION | WS_SYSMENU,
+               WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT) == nullptr) {
+      return IDCANCEL;
+    }
+
+    if (owner_window != nullptr) {
+      ::EnableWindow(owner_window, FALSE);
+    }
+
+    CenterWindow(owner_window);
+    ShowWindow(SW_SHOWNORMAL);
+    SetForegroundWindow(m_hWnd);
+
+    MSG message{};
+    while (modal_result_ == 0 && IsWindow()) {
+      const auto message_result = GetMessage(&message, nullptr, 0, 0);
+      if (message_result <= 0) {
+        modal_result_ = IDCANCEL;
+        break;
+      }
+
+      if (!IsDialogMessage(&message)) {
+        TranslateMessage(&message);
+        DispatchMessage(&message);
+      }
+    }
+
+    if (IsWindow()) {
+      DestroyWindow();
+    }
+
+    if (owner_window != nullptr && ::IsWindow(owner_window)) {
+      ::EnableWindow(owner_window, TRUE);
+      ::SetActiveWindow(owner_window);
+      ::SetForegroundWindow(owner_window);
+    }
+
+    return modal_result_ == 0 ? IDCANCEL : modal_result_;
+  }
+
+  const AppSettings& settings() const {
+    return settings_;
+  }
+
+  BEGIN_MSG_MAP(SettingsDialog)
+    MSG_WM_CREATE(OnCreate)
+    MSG_WM_CLOSE(OnClose)
+    MSG_WM_DESTROY(OnDestroy)
+    MSG_WM_PAINT(OnPaint)
+    MSG_WM_ERASEBKGND(OnEraseBkgnd)
+    COMMAND_ID_HANDLER_EX(kControlDeepScanOn, OnDeepScanToggle)
+    COMMAND_ID_HANDLER_EX(kControlDeepScanOff, OnDeepScanToggle)
+    COMMAND_ID_HANDLER_EX(kControlAddFilter, OnAddFilter)
+    COMMAND_ID_HANDLER_EX(kControlRemoveFilter, OnRemoveFilter)
+    COMMAND_ID_HANDLER_EX(IDOK, OnSave)
+    COMMAND_ID_HANDLER_EX(IDCANCEL, OnCancel)
+    COMMAND_HANDLER_EX(kControlFilterList, LBN_SELCHANGE,
+                       OnFilterSelectionChange)
+    MESSAGE_HANDLER(WM_DRAWITEM, OnDrawItem)
+    MESSAGE_HANDLER(WM_CTLCOLORDLG, OnCtlColorDialog)
+    MESSAGE_HANDLER(WM_CTLCOLORSTATIC, OnCtlColorStatic)
+    MESSAGE_HANDLER(WM_CTLCOLORBTN, OnCtlColorStatic)
+    MESSAGE_HANDLER(WM_CTLCOLOREDIT, OnCtlColorEdit)
+    MESSAGE_HANDLER(WM_CTLCOLORLISTBOX, OnCtlColorEdit)
+  END_MSG_MAP()
+
+ private:
+  enum ControlIds {
+    kControlDeepScanOn = 5001,
+    kControlDeepScanOff = 5002,
+    kControlFilterText = 5003,
+    kControlAddFilter = 5004,
+    kControlRemoveFilter = 5005,
+    kControlFilterList = 5006,
+    kControlStartupCheck = 5007,
+  };
+
+  int OnCreate(CREATESTRUCT* /*create*/) {
+    InitializeFonts();
+
+    background_brush_.CreateSolidBrush(kSettingsDialogBackground);
+    panel_brush_.CreateSolidBrush(kSettingsDialogPanelBackground);
+    footer_brush_.CreateSolidBrush(kSettingsDialogFooterBackground);
+    input_brush_.CreateSolidBrush(kSettingsDialogInputBackground);
+
+    const auto scale = [&](int value) { return ScaleForDpi(dpi_, value); };
+    const auto apply_font = [&](HWND window, HFONT font) {
+      if (window != nullptr) {
+        SendMessage(window, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+      }
+    };
+    const auto create_static = [&](const wchar_t* text, DWORD style, int x,
+                                   int y, int width, int height,
+                                   HFONT font) -> HWND {
+      HWND window = ::CreateWindowExW(
+          0, L"STATIC", text,
+          WS_CHILD | WS_VISIBLE | style | SS_LEFT,
+          scale(x), scale(y), scale(width), scale(height), m_hWnd, nullptr,
+          _AtlBaseModule.GetModuleInstance(), nullptr);
+      apply_font(window, font);
+      return window;
+    };
+    const auto create_button = [&](const wchar_t* text, DWORD style,
+                                   DWORD ex_style, int x, int y, int width,
+                                   int height, int control_id,
+                                   HFONT font) -> HWND {
+      HWND window = ::CreateWindowExW(
+          ex_style, L"BUTTON", text, WS_CHILD | WS_VISIBLE | style,
+          scale(x), scale(y), scale(width), scale(height), m_hWnd,
+          reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
+          _AtlBaseModule.GetModuleInstance(), nullptr);
+      apply_font(window, font);
+      return window;
+    };
+
+    hero_eyebrow_.Attach(create_static(L"UTILITY CONTROLS", 0, 28, 22, 180, 16,
+                                       heading_font_));
+    hero_title_.Attach(
+        create_static(L"Settings", 0, 28, 40, 220, 30, title_font_));
+    hero_body_.Attach(create_static(
+        L"Tune scan depth, exclusion rules, and startup behavior without "
+        L"leaving the Patch Cleaner workflow.",
+        SS_LEFT, 28, 74, 286, 34, body_font_));
+
+    deep_scan_heading_.Attach(
+        create_static(L"Deep Scan", 0, 352, 30, 120, 18, heading_font_));
+    deep_scan_caption_.Attach(create_static(
+        L"Metadata + signer matching", 0, 352, 50, 172, 16, caption_font_));
+    create_button(L"On", BS_AUTORADIOBUTTON | BS_PUSHLIKE | BS_OWNERDRAW |
+                            WS_TABSTOP | WS_GROUP,
+                  0, 352, 72, 80, 34, kControlDeepScanOn, button_font_);
+    create_button(L"Off", BS_AUTORADIOBUTTON | BS_PUSHLIKE | BS_OWNERDRAW, 0,
+                  438, 72, 80, 34, kControlDeepScanOff, button_font_);
+
+    deep_scan_body_.Attach(create_static(
+        L"The deep scan reads MSI/MSP metadata and signer details to improve "
+        L"filtering. It uses more memory and can slow large scans down, but "
+        L"it helps avoid false positives.",
+        SS_LEFT, 28, 114, 500, 34, body_font_));
+
+    filter_heading_.Attach(
+        create_static(L"Exclusion Filter", 0, 28, 178, 200, 18, heading_font_));
+    filter_body_.Attach(create_static(
+        L"Add contains-filters to hide known-safe orphaned files. Patch "
+        L"Cleaner matches file paths immediately and, with Deep Scan on, also "
+        L"checks MSI/MSP title, subject, author, and signer information.",
+        SS_LEFT, 28, 204, 512, 54, body_font_));
+
+    CRect filter_edit_rect(scale(28), scale(266), scale(440), scale(298));
+    filter_edit_.Create(m_hWnd, filter_edit_rect, nullptr,
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                        WS_EX_CLIENTEDGE, kControlFilterText);
+    filter_edit_.SetFont(body_font_);
+
+    add_filter_button_.Attach(create_button(
+        L"+", BS_OWNERDRAW | WS_TABSTOP, 0, 448, 265, 32, 32,
+        kControlAddFilter, button_font_));
+    remove_filter_button_.Attach(create_button(
+        L"-", BS_OWNERDRAW | WS_TABSTOP, 0, 486, 265, 32, 32,
+        kControlRemoveFilter, button_font_));
+
+    CRect filter_list_rect(scale(28), scale(312), scale(540), scale(400));
+    filter_list_.Create(m_hWnd, filter_list_rect, nullptr,
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                            LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                        WS_EX_CLIENTEDGE, kControlFilterList);
+    filter_list_.SetFont(body_font_);
+
+    startup_check_.Attach(create_button(
+        L"Perform Missing Files Check on startup",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 426, 300, 24,
+        kControlStartupCheck, body_font_));
+    footer_hint_.Attach(create_static(
+        L"Applies to the next scan and is stored locally on this PC.",
+        SS_LEFT, 28, 452, 320, 16, caption_font_));
+
+    save_button_.Attach(create_button(L"Save", BS_OWNERDRAW | WS_TABSTOP, 0,
+                                      388, 424, 72, 32, IDOK, button_font_));
+    cancel_button_.Attach(create_button(L"Cancel", BS_OWNERDRAW | WS_TABSTOP,
+                                        0, 468, 424, 84, 32, IDCANCEL,
+                                        button_font_));
+
+    deep_scan_on_.Attach(GetDlgItem(kControlDeepScanOn));
+    deep_scan_off_.Attach(GetDlgItem(kControlDeepScanOff));
+    UpdateDeepScanButtons();
+    startup_check_.SetCheck(settings_.missing_files_check_on_startup
+                                ? BST_CHECKED
+                                : BST_UNCHECKED);
+
+    RefreshFilterList();
+    filter_edit_.SetFocus();
+    return 0;
+  }
+
+  void OnClose() {
+    EndModal(IDCANCEL);
+  }
+
+  void OnDestroy() {
+    if (!heading_font_.IsNull()) {
+      heading_font_.DeleteObject();
+    }
+    if (!title_font_.IsNull()) {
+      title_font_.DeleteObject();
+    }
+    if (!body_font_.IsNull()) {
+      body_font_.DeleteObject();
+    }
+    if (!caption_font_.IsNull()) {
+      caption_font_.DeleteObject();
+    }
+    if (!button_font_.IsNull()) {
+      button_font_.DeleteObject();
+    }
+    if (!background_brush_.IsNull()) {
+      background_brush_.DeleteObject();
+    }
+    if (!panel_brush_.IsNull()) {
+      panel_brush_.DeleteObject();
+    }
+    if (!footer_brush_.IsNull()) {
+      footer_brush_.DeleteObject();
+    }
+    if (!input_brush_.IsNull()) {
+      input_brush_.DeleteObject();
+    }
+  }
+
+  void OnPaint(CDCHandle dc) {
+    CDCHandle target_dc(dc);
+    if (target_dc == nullptr) {
+      CPaintDC paint_dc(m_hWnd);
+      OnPaint(paint_dc.m_hDC);
+      return;
+    }
+
+    CRect client_rect;
+    GetClientRect(&client_rect);
+    if (client_rect.IsRectEmpty()) {
+      return;
+    }
+
+    FillRectColor(target_dc, client_rect, kSettingsDialogBackground);
+
+    const auto scale = [&](int value) { return ScaleForDpi(dpi_, value); };
+
+    CRect top_panel(scale(16), scale(14), client_rect.right - scale(16),
+                    scale(154));
+    FillRoundedRect(target_dc, top_panel, kSettingsDialogPanelBackground,
+                    BlendColor(kSettingsDialogBorder, kSettingsDialogAccent, 14),
+                    scale(18));
+    CRect top_rule = top_panel;
+    top_rule.left += scale(18);
+    top_rule.right -= scale(18);
+    top_rule.top += scale(12);
+    top_rule.bottom = top_rule.top + scale(3);
+    FillRectColor(target_dc, top_rule, kSettingsDialogAccent);
+
+    CRect filters_panel(scale(16), scale(170), client_rect.right - scale(16),
+                        scale(410));
+    FillRoundedRect(target_dc, filters_panel, kSettingsDialogPanelBackground,
+                    kSettingsDialogBorder, scale(18));
+    CRect filters_rule = filters_panel;
+    filters_rule.left += scale(18);
+    filters_rule.right -= scale(18);
+    filters_rule.top += scale(14);
+    filters_rule.bottom = filters_rule.top + 1;
+    FillRectColor(target_dc, filters_rule,
+                  BlendColor(kSettingsDialogDivider, kSettingsDialogAccent, 24));
+
+    CRect footer_panel(scale(16), scale(416), client_rect.right - scale(16),
+                       client_rect.bottom - scale(16));
+    FillRoundedRect(target_dc, footer_panel, kSettingsDialogFooterBackground,
+                    kSettingsDialogBorder, scale(18));
+    CRect footer_rule = footer_panel;
+    footer_rule.left += scale(18);
+    footer_rule.right -= scale(18);
+    footer_rule.top += scale(12);
+    footer_rule.bottom = footer_rule.top + 1;
+    FillRectColor(target_dc, footer_rule, kSettingsDialogDivider);
+  }
+
+  BOOL OnEraseBkgnd(CDCHandle /*dc*/) {
+    return TRUE;
+  }
+
+  LRESULT OnDrawItem(UINT /*message*/, WPARAM /*w_param*/, LPARAM l_param,
+                     BOOL& handled) {
+    handled = TRUE;
+
+    const auto* draw =
+        reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
+    if (draw == nullptr || draw->CtlType != ODT_BUTTON) {
+      handled = FALSE;
+      return 0;
+    }
+
+    const auto scale = [&](int value) { return ScaleForDpi(dpi_, value); };
+    const auto control_id = static_cast<int>(draw->CtlID);
+    const auto enabled = (draw->itemState & ODS_DISABLED) == 0;
+    const auto hot = (draw->itemState & ODS_HOTLIGHT) != 0;
+    const auto pressed = (draw->itemState & ODS_SELECTED) != 0;
+    const auto segmented =
+        control_id == kControlDeepScanOn || control_id == kControlDeepScanOff;
+    const auto checked =
+        segmented &&
+        ((control_id == kControlDeepScanOn && deep_scan_enabled_selection_) ||
+         (control_id == kControlDeepScanOff && !deep_scan_enabled_selection_));
+    const auto primary = control_id == IDOK || control_id == kControlAddFilter;
+    const auto danger = control_id == kControlRemoveFilter;
+
+    COLORREF fill_color =
+        primary ? kSettingsDialogAccent : kSettingsDialogFooterBackground;
+    COLORREF border_color =
+        primary ? kSettingsDialogAccentDark : kSettingsDialogBorder;
+    COLORREF text_color =
+        primary ? kSettingsDialogButtonTextOnAccent : kSettingsDialogText;
+    if (segmented) {
+      fill_color = checked ? BlendColor(kSettingsDialogAccentDark,
+                                        kSettingsDialogAccent, 72)
+                           : BlendColor(kSettingsDialogInputBackground,
+                                        kSettingsDialogBackground, 22);
+      border_color =
+          checked ? kSettingsDialogAccentDark
+                  : BlendColor(kSettingsDialogBorder, kSettingsDialogAccent, 18);
+      text_color = checked ? kSettingsDialogButtonTextOnAccent
+                           : kSettingsDialogMutedText;
+      if (hot && !checked) {
+        fill_color =
+            BlendColor(kSettingsDialogInputBackground, kSettingsDialogAccent, 12);
+      }
+    } else if (!enabled) {
+      fill_color = primary ? BlendColor(kSettingsDialogBackground,
+                                        kSettingsDialogAccent, 12)
+                           : RGB(233, 227, 220);
+      border_color = BlendColor(kSettingsDialogBorder,
+                                kSettingsDialogFooterBackground, 20);
+      text_color = kSettingsDialogDisabledText;
+    } else if (danger) {
+      fill_color = hot ? BlendColor(kSettingsDialogFooterBackground,
+                                    kSettingsDialogDanger, 16)
+                       : BlendColor(kSettingsDialogFooterBackground,
+                                    kSettingsDialogDanger, 6);
+      border_color = BlendColor(kSettingsDialogDanger, kSettingsDialogFooterBackground,
+                                hot ? 5 : 18);
+      text_color =
+          hot ? kSettingsDialogDanger
+              : BlendColor(kSettingsDialogText, kSettingsDialogDanger, 70);
+    } else if (!primary) {
+      fill_color = hot ? BlendColor(kSettingsDialogFooterBackground,
+                                    kSettingsDialogAccent, 10)
+                       : kSettingsDialogFooterBackground;
+      border_color = hot ? BlendColor(kSettingsDialogBorder,
+                                      kSettingsDialogAccent, 45)
+                         : kSettingsDialogBorder;
+    }
+
+    if (pressed && enabled) {
+      fill_color = BlendColor(fill_color, RGB(32, 28, 24), 10);
+      border_color = BlendColor(border_color, RGB(32, 28, 24), 12);
+    }
+
+    CDCHandle control_dc(draw->hDC);
+    CRect rect(draw->rcItem);
+    FillRoundedRect(control_dc, rect, fill_color, border_color,
+                    segmented ? scale(16) : scale(12));
+    if (segmented && checked) {
+      CRect inner_rect(rect);
+      inner_rect.DeflateRect(scale(3), scale(3));
+      DrawRectOutline(control_dc, inner_rect,
+                      BlendColor(kSettingsDialogButtonTextOnAccent,
+                                 kSettingsDialogAccentDark, 24));
+    }
+
+    wchar_t buffer[128]{};
+    ::GetWindowTextW(draw->hwndItem, buffer, _countof(buffer));
+    const auto old_font = control_dc.SelectFont(button_font_);
+    const auto old_mode = control_dc.SetBkMode(TRANSPARENT);
+    const auto old_color = control_dc.SetTextColor(text_color);
+    CRect text_rect(rect);
+    control_dc.DrawText(buffer, -1, &text_rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    control_dc.SetTextColor(old_color);
+    control_dc.SetBkMode(old_mode);
+    control_dc.SelectFont(old_font);
+
+    if ((draw->itemState & ODS_FOCUS) != 0) {
+      CRect focus_rect(rect);
+      focus_rect.DeflateRect(scale(4), scale(4));
+      control_dc.DrawFocusRect(&focus_rect);
+    }
+
+    return TRUE;
+  }
+
+  void OnAddFilter(UINT /*notify_code*/, int /*id*/, CWindow /*control*/) {
+    AddFilterFromEdit();
+  }
+
+  void OnDeepScanToggle(UINT /*notify_code*/, int id, CWindow /*control*/) {
+    deep_scan_enabled_selection_ = id == kControlDeepScanOn;
+    UpdateDeepScanButtons();
+  }
+
+  void OnRemoveFilter(UINT /*notify_code*/, int /*id*/, CWindow /*control*/) {
+    const auto selected_index = filter_list_.GetCurSel();
+    if (selected_index < 0 ||
+        selected_index >= static_cast<int>(settings_.exclusion_filters.size())) {
+      return;
+    }
+
+    settings_.exclusion_filters.erase(settings_.exclusion_filters.begin() +
+                                      selected_index);
+    RefreshFilterList();
+    if (selected_index < filter_list_.GetCount()) {
+      filter_list_.SetCurSel(selected_index);
+    } else if (filter_list_.GetCount() > 0) {
+      filter_list_.SetCurSel(filter_list_.GetCount() - 1);
+    }
+    UpdateRemoveButton();
+  }
+
+  void OnSave(UINT /*notify_code*/, int /*id*/, CWindow /*control*/) {
+    AddFilterFromEdit();
+    settings_.deep_scan_enabled = deep_scan_enabled_selection_;
+    settings_.missing_files_check_on_startup =
+        startup_check_.GetCheck() == BST_CHECKED;
+    EndModal(IDOK);
+  }
+
+  void OnCancel(UINT /*notify_code*/, int /*id*/, CWindow /*control*/) {
+    EndModal(IDCANCEL);
+  }
+
+  void OnFilterSelectionChange(UINT /*notify_code*/, int /*id*/,
+                               CWindow /*control*/) {
+    UpdateRemoveButton();
+  }
+
+  LRESULT OnCtlColorDialog(UINT /*message*/, WPARAM w_param, LPARAM /*l_param*/,
+                           BOOL& handled) {
+    handled = TRUE;
+    SetBkColor(reinterpret_cast<HDC>(w_param), kSettingsDialogBackground);
+    return reinterpret_cast<LRESULT>(background_brush_.m_hBrush);
+  }
+
+  LRESULT OnCtlColorStatic(UINT /*message*/, WPARAM w_param, LPARAM l_param,
+                           BOOL& handled) {
+    handled = TRUE;
+    const auto child_window = reinterpret_cast<HWND>(l_param);
+    auto text_color = kSettingsDialogText;
+    if (child_window == hero_eyebrow_.m_hWnd) {
+      text_color = kSettingsDialogAccent;
+    } else if (child_window == hero_title_.m_hWnd) {
+      text_color = kSettingsDialogText;
+    } else if (child_window == hero_body_.m_hWnd ||
+               child_window == deep_scan_body_.m_hWnd ||
+               child_window == filter_body_.m_hWnd ||
+               child_window == deep_scan_caption_.m_hWnd ||
+               child_window == footer_hint_.m_hWnd) {
+      text_color = kSettingsDialogMutedText;
+    } else if (child_window == deep_scan_heading_.m_hWnd ||
+               child_window == filter_heading_.m_hWnd) {
+      text_color = kSettingsDialogAccentDark;
+    }
+
+    SetTextColor(reinterpret_cast<HDC>(w_param), text_color);
+    SetBkMode(reinterpret_cast<HDC>(w_param), TRANSPARENT);
+    return reinterpret_cast<LRESULT>(GetSectionBrush(child_window));
+  }
+
+  LRESULT OnCtlColorEdit(UINT /*message*/, WPARAM w_param, LPARAM /*l_param*/,
+                         BOOL& handled) {
+    handled = TRUE;
+    SetTextColor(reinterpret_cast<HDC>(w_param), kSettingsDialogText);
+    SetBkColor(reinterpret_cast<HDC>(w_param), kSettingsDialogInputBackground);
+    return reinterpret_cast<LRESULT>(input_brush_.m_hBrush);
+  }
+
+  void InitializeFonts() {
+    const auto base_font = BuildBaseUiFont();
+    const auto create_font = [&](CFont* font, int point_size, LONG weight) {
+      LOGFONT face = base_font;
+      face.lfHeight = -MulDiv(point_size, static_cast<int>(dpi_), 72);
+      face.lfWeight = weight;
+      face.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+      font->CreateFontIndirect(&face);
+    };
+
+    create_font(&heading_font_, 9, FW_SEMIBOLD);
+    create_font(&title_font_, 21, FW_SEMIBOLD);
+    create_font(&body_font_, 10, FW_NORMAL);
+    create_font(&caption_font_, 9, FW_NORMAL);
+    create_font(&button_font_, 10, FW_SEMIBOLD);
+  }
+
+  bool AddFilterFromEdit() {
+    const auto text_length = filter_edit_.GetWindowTextLength();
+    if (text_length <= 0) {
+      return false;
+    }
+
+    CString filter_text;
+    filter_edit_.GetWindowText(filter_text);
+    const auto normalized_filter =
+        TrimWhitespace(std::wstring(filter_text.GetString()));
+    if (normalized_filter.empty()) {
+      filter_edit_.SetWindowText(L"");
+      return false;
+    }
+
+    if (!ContainsFilterValue(settings_.exclusion_filters, normalized_filter)) {
+      settings_.exclusion_filters.push_back(normalized_filter);
+      RefreshFilterList();
+      filter_list_.SetCurSel(filter_list_.GetCount() - 1);
+    }
+
+    filter_edit_.SetWindowText(L"");
+    UpdateRemoveButton();
+    return true;
+  }
+
+  void RefreshFilterList() {
+    filter_list_.ResetContent();
+    for (const auto& filter : settings_.exclusion_filters) {
+      filter_list_.AddString(filter.c_str());
+    }
+    UpdateRemoveButton();
+  }
+
+  void UpdateDeepScanButtons() {
+    if (deep_scan_on_.IsWindow()) {
+      deep_scan_on_.SetCheck(deep_scan_enabled_selection_ ? BST_CHECKED
+                                                          : BST_UNCHECKED);
+      deep_scan_on_.Invalidate();
+    }
+    if (deep_scan_off_.IsWindow()) {
+      deep_scan_off_.SetCheck(deep_scan_enabled_selection_ ? BST_UNCHECKED
+                                                           : BST_CHECKED);
+      deep_scan_off_.Invalidate();
+    }
+  }
+
+  void UpdateRemoveButton() {
+    remove_filter_button_.EnableWindow(filter_list_.GetCurSel() >= 0);
+  }
+
+  void EndModal(int result) {
+    modal_result_ = result;
+    if (IsWindow()) {
+      DestroyWindow();
+    }
+  }
+
+  HBRUSH GetSectionBrush(HWND child_window) const {
+    if (child_window == nullptr) {
+      return background_brush_.m_hBrush;
+    }
+
+    RECT child_rect{};
+    if (!::GetWindowRect(child_window, &child_rect) ||
+        !::MapWindowPoints(HWND_DESKTOP, m_hWnd,
+                           reinterpret_cast<POINT*>(&child_rect), 2)) {
+      return background_brush_.m_hBrush;
+    }
+
+    return child_rect.top >= ScaleForDpi(dpi_, 416) ? footer_brush_.m_hBrush
+                                                    : panel_brush_.m_hBrush;
+  }
+
+  AppSettings settings_;
+  int modal_result_;
+  UINT dpi_;
+  bool deep_scan_enabled_selection_;
+  CBrush background_brush_;
+  CBrush panel_brush_;
+  CBrush footer_brush_;
+  CBrush input_brush_;
+  CFont heading_font_;
+  CFont title_font_;
+  CFont body_font_;
+  CFont caption_font_;
+  CFont button_font_;
+  CWindow hero_eyebrow_;
+  CWindow hero_title_;
+  CWindow hero_body_;
+  CWindow deep_scan_heading_;
+  CWindow deep_scan_caption_;
+  CWindow deep_scan_body_;
+  CWindow filter_heading_;
+  CWindow filter_body_;
+  CWindow footer_hint_;
+  CButton deep_scan_on_;
+  CButton deep_scan_off_;
+  CEdit filter_edit_;
+  CButton add_filter_button_;
+  CButton remove_filter_button_;
+  CListBox filter_list_;
+  CButton startup_check_;
+  CButton save_button_;
+  CButton cancel_button_;
+};
+
+struct CertContextDeleter {
+  void operator()(const CERT_CONTEXT* certificate) const {
+    if (certificate != nullptr) {
+      CertFreeCertificateContext(certificate);
+    }
+  }
+};
+
+bool ReadSummaryPropertyString(const std::wstring& path, UINT property_id,
+                               std::wstring* value) {
+  if (value == nullptr) {
+    return false;
+  }
+
+  MSIHANDLE summary_handle = 0;
+  if (MsiGetSummaryInformationW(0, path.c_str(), 0, &summary_handle) !=
+      ERROR_SUCCESS) {
+    return false;
+  }
+
+  const auto close_handle = [&]() {
+    if (summary_handle != 0) {
+      MsiCloseHandle(summary_handle);
+      summary_handle = 0;
+    }
+  };
+
+  UINT data_type = 0;
+  INT integer_value = 0;
+  FILETIME time_value{};
+  DWORD length = 0;
+  auto result =
+      MsiSummaryInfoGetPropertyW(summary_handle, property_id, &data_type,
+                                 &integer_value, &time_value, nullptr, &length);
+  if (result != ERROR_SUCCESS && result != ERROR_MORE_DATA) {
+    close_handle();
+    return false;
+  }
+
+  if (length == 0) {
+    value->clear();
+    close_handle();
+    return result == ERROR_SUCCESS;
+  }
+
+  std::vector<wchar_t> buffer(length + 1, L'\0');
+  result = MsiSummaryInfoGetPropertyW(summary_handle, property_id, &data_type,
+                                      &integer_value, &time_value,
+                                      buffer.data(), &length);
+  close_handle();
+  if (result != ERROR_SUCCESS) {
+    return false;
+  }
+
+  value->assign(buffer.data(), length);
+  return true;
+}
+
+void AppendMetadataValue(const std::wstring& value, std::wstring* metadata) {
+  if (metadata == nullptr || value.empty()) {
+    return;
+  }
+
+  if (!metadata->empty()) {
+    metadata->append(L"\n");
+  }
+  metadata->append(value);
+}
+
+std::wstring GetSignerDisplayName(const std::wstring& path) {
+  PCCERT_CONTEXT raw_certificate = nullptr;
+  if (FAILED(MsiGetFileSignatureInformationW(path.c_str(), 0, &raw_certificate,
+                                             nullptr, nullptr)) ||
+      raw_certificate == nullptr) {
+    return std::wstring();
+  }
+
+  std::unique_ptr<const CERT_CONTEXT, CertContextDeleter> certificate(
+      raw_certificate);
+  const auto read_name = [&](DWORD flags) {
+    const auto size = CertGetNameStringW(
+        certificate.get(), CERT_NAME_SIMPLE_DISPLAY_TYPE, flags, nullptr,
+        nullptr, 0);
+    if (size <= 1) {
+      return std::wstring();
+    }
+
+    std::vector<wchar_t> buffer(size);
+    if (CertGetNameStringW(certificate.get(), CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                           flags, nullptr, buffer.data(),
+                           static_cast<DWORD>(buffer.size())) <= 1) {
+      return std::wstring();
+    }
+
+    return std::wstring(buffer.data());
+  };
+
+  const auto subject_name = read_name(0);
+  const auto issuer_name = read_name(CERT_NAME_ISSUER_FLAG);
+  if (subject_name.empty()) {
+    return issuer_name;
+  }
+  if (issuer_name.empty() || _wcsicmp(subject_name.c_str(), issuer_name.c_str()) == 0) {
+    return subject_name;
+  }
+
+  return subject_name + L" " + issuer_name;
+}
+
+std::wstring BuildDeepScanMetadata(const std::wstring& path) {
+  std::wstring metadata;
+
+  std::wstring title;
+  if (ReadSummaryPropertyString(path, PID_TITLE, &title)) {
+    AppendMetadataValue(title, &metadata);
+  }
+
+  std::wstring subject;
+  if (ReadSummaryPropertyString(path, PID_SUBJECT, &subject)) {
+    AppendMetadataValue(subject, &metadata);
+  }
+
+  std::wstring author;
+  if (ReadSummaryPropertyString(path, PID_AUTHOR, &author)) {
+    AppendMetadataValue(author, &metadata);
+  }
+
+  AppendMetadataValue(GetSignerDisplayName(path), &metadata);
+  return metadata;
+}
+
+bool ShouldExcludeFile(const std::wstring& path,
+                       const std::vector<std::wstring>& filters,
+                       bool deep_scan_enabled) {
+  if (filters.empty()) {
+    return false;
+  }
+
+  for (const auto& filter : filters) {
+    if (ContainsStringIgnoreCase(path, filter)) {
+      return true;
+    }
+  }
+
+  if (!deep_scan_enabled) {
+    return false;
+  }
+
+  const auto metadata = BuildDeepScanMetadata(path);
+  if (metadata.empty()) {
+    return false;
+  }
+
+  for (const auto& filter : filters) {
+    if (ContainsStringIgnoreCase(metadata, filter)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 const wchar_t* GetOperationToken(MutationOperation operation) {
@@ -1468,13 +2538,15 @@ MainFrame::MainFrame()
       selected_size_(0),
       moved_size_(0),
       deleted_size_(0),
+      excluded_size_(0),
       total_reclaimable_size_(0),
       selected_count_(0),
+      excluded_count_(0),
       total_reclaimable_count_(0),
       sort_column_(0),
       hot_button_(0),
       pressed_button_(0),
-      reveal_progress_(0),
+      reveal_progress_(100),
       action_progress_(0),
       selected_flash_(0),
       moved_flash_(0),
@@ -1488,8 +2560,11 @@ MainFrame::MainFrame()
       tracking_mouse_(false),
       has_last_scan_(false),
       last_scan_succeeded_(false),
+      deep_scan_enabled_(true),
+      missing_files_check_on_startup_(false),
       recovered_last_operation_(false),
-      busy_operation_(BusyOperation::kNone) {
+      busy_operation_(BusyOperation::kNone),
+      share_feedback_deadline_(0) {
   ZeroMemory(&last_scan_time_, sizeof(last_scan_time_));
 }
 
@@ -1507,6 +2582,13 @@ int MainFrame::OnCreate(CREATESTRUCT* /*create*/) {
 
   if (!app::GetApplication()->GetMessageLoop()->AddMessageFilter(this)) {
     return -1;
+  }
+
+  AppSettings settings;
+  if (LoadAppSettings(&settings)) {
+    deep_scan_enabled_ = settings.deep_scan_enabled;
+    missing_files_check_on_startup_ = settings.missing_files_check_on_startup;
+    exclusion_filters_ = settings.exclusion_filters;
   }
 
   RebuildFonts();
@@ -1537,6 +2619,9 @@ int MainFrame::OnCreate(CREATESTRUCT* /*create*/) {
   SyncListAppearance();
   RefreshChrome(false, true);
   BeginSettleAnimation();
+  if (missing_files_check_on_startup_) {
+    PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
+  }
 
   return 0;
 }
@@ -1640,6 +2725,13 @@ void MainFrame::OnTimer(UINT_PTR event_id) {
     return;
   }
 
+  auto share_feedback_expired = false;
+  if (share_feedback_deadline_ != 0 &&
+      GetTickCount64() >= share_feedback_deadline_) {
+    share_feedback_deadline_ = 0;
+    share_feedback_expired = true;
+  }
+
   const auto action_target = selected_count_ > 0 ? 100 : 0;
   const auto reveal_changed = StepAnimationToward(&reveal_progress_, 100, 18);
   const auto action_changed =
@@ -1650,21 +2742,28 @@ void MainFrame::OnTimer(UINT_PTR event_id) {
   const auto scan_flash_changed = DecayFlashValue(&scan_flash_, 10);
   const auto animating =
       reveal_changed || action_changed || selected_flash_changed ||
-      moved_flash_changed || deleted_flash_changed || scan_flash_changed;
+      moved_flash_changed || deleted_flash_changed || scan_flash_changed ||
+      share_feedback_deadline_ != 0;
 
   if (!animating) {
     KillTimer(kAnimationTimerId);
   }
 
-  if (reveal_changed || action_changed) {
+  if (reveal_changed) {
     LayoutChildren();
     Invalidate(FALSE);
     return;
+  }
+  if (action_changed) {
+    InvalidateRect(action_rail_rect_, FALSE);
   }
 
   if (scan_flash_changed) {
     InvalidateRect(command_band_rect_, FALSE);
     InvalidateRect(list_frame_rect_, FALSE);
+  }
+  if (share_feedback_expired) {
+    InvalidateRect(command_band_rect_, FALSE);
   }
   if (selected_flash_changed || moved_flash_changed || deleted_flash_changed) {
     InvalidateRect(action_rail_rect_, FALSE);
@@ -1786,6 +2885,27 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
     files.clear();
   }
 
+  excluded_count_ = 0;
+  excluded_size_ = 0;
+  if (scan_complete && !exclusion_filters_.empty()) {
+    FileSizeMap visible_files;
+    auto evaluated = 0;
+    for (const auto& pair : files) {
+      if (ShouldExcludeFile(pair.first, exclusion_filters_, deep_scan_enabled_)) {
+        ++excluded_count_;
+        excluded_size_ += pair.second;
+      } else {
+        visible_files.insert(pair);
+      }
+
+      ++evaluated;
+      if ((evaluated % static_cast<int>(kResponsivePumpStride)) == 0) {
+        PumpResponsiveUiMessages();
+      }
+    }
+    files.swap(visible_files);
+  }
+
   total_reclaimable_count_ = static_cast<int>(files.size());
   total_reclaimable_size_ = 0;
   for (const auto& pair : files) {
@@ -1872,6 +2992,69 @@ void MainFrame::OnEditSelectAll(UINT /*notify_code*/, int /*id*/,
   if (pending_selection_refresh_ || any_changed) {
     pending_selection_refresh_ = false;
     RefreshChrome(true);
+  }
+}
+
+void MainFrame::OnEditCopySummary(UINT /*notify_code*/, int /*id*/,
+                                  CWindow /*control*/) {
+  if (IsBusy() || !has_last_scan_ || !last_scan_succeeded_) {
+    return;
+  }
+
+  TrackShareMetric(kShareEventClicked, total_reclaimable_count_,
+                   total_reclaimable_size_, selected_count_, selected_size_,
+                   last_scan_succeeded_);
+
+  if (!CopyTextToClipboard(m_hWnd, BuildShareSummaryText())) {
+    TrackShareMetric(kShareEventCopyFailed, total_reclaimable_count_,
+                     total_reclaimable_size_, selected_count_, selected_size_,
+                     last_scan_succeeded_);
+    MessageBox(L"Patch Cleaner could not copy the share summary to the "
+               L"clipboard.",
+               L"Patch Cleaner", MB_ICONERROR | MB_OK);
+    return;
+  }
+
+  TrackShareMetric(kShareEventCopied, total_reclaimable_count_,
+                   total_reclaimable_size_, selected_count_, selected_size_,
+                   last_scan_succeeded_);
+  share_feedback_deadline_ = GetTickCount64() + kShareFeedbackDurationMs;
+  scan_flash_ = 100;
+  EnsureAnimationTimer();
+  InvalidateRect(command_band_rect_, FALSE);
+}
+
+void MainFrame::OnAppSettings(UINT /*notify_code*/, int /*id*/,
+                              CWindow /*control*/) {
+  if (IsBusy()) {
+    return;
+  }
+
+  AppSettings current_settings;
+  current_settings.deep_scan_enabled = deep_scan_enabled_;
+  current_settings.missing_files_check_on_startup =
+      missing_files_check_on_startup_;
+  current_settings.exclusion_filters = exclusion_filters_;
+
+  SettingsDialog dialog(current_settings);
+  if (dialog.DoModal(m_hWnd) != IDOK) {
+    return;
+  }
+
+  if (!SaveAppSettings(dialog.settings())) {
+    MessageBox(L"Patch Cleaner could not save the current settings.",
+               L"Patch Cleaner", MB_ICONERROR | MB_OK);
+    return;
+  }
+
+  deep_scan_enabled_ = dialog.settings().deep_scan_enabled;
+  missing_files_check_on_startup_ =
+      dialog.settings().missing_files_check_on_startup;
+  exclusion_filters_ = dialog.settings().exclusion_filters;
+  InvalidateRect(command_band_rect_, FALSE);
+
+  if (has_last_scan_) {
+    PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
   }
 }
 
@@ -2083,6 +3266,7 @@ void MainFrame::SetBusyOperation(BusyOperation operation) {
   }
 
   if (IsBusy()) {
+    share_feedback_deadline_ = 0;
     UpdateHotButton(0);
     if (GetCapture() == m_hWnd) {
       ReleaseCapture();
@@ -2168,10 +3352,7 @@ void MainFrame::LayoutChildren() {
   const auto outer = ScaleForDpi(dpi_, 20);
   const auto gap = ScaleForDpi(dpi_, 14);
   const auto command_height = ScaleForDpi(dpi_, 182);
-  const auto action_height = ScaleForDpi(dpi_, 96) +
-                             MulDiv(ScaleForDpi(dpi_, 34), action_progress_, 100);
-  const auto settle_offset =
-      MulDiv(ScaleForDpi(dpi_, 12), 100 - reveal_progress_, 100);
+  const auto action_height = ScaleForDpi(dpi_, 96);
 
   command_band_rect_.SetRect(outer, outer, client_rect.right - outer,
                              outer + command_height);
@@ -2184,24 +3365,35 @@ void MainFrame::LayoutChildren() {
   const auto button_gap = ScaleForDpi(dpi_, 10);
   const auto button_padding_right = ScaleForDpi(dpi_, 24);
   const auto scan_width = ScaleForDpi(dpi_, 148);
-  const auto scan_top = command_band_rect_.top + ScaleForDpi(dpi_, 42) +
-                        settle_offset / 3;
+  const auto summary_width = ScaleForDpi(dpi_, 148);
+  const auto scan_top = command_band_rect_.top + ScaleForDpi(dpi_, 42);
   scan_button_rect_.SetRect(command_band_rect_.right - button_padding_right -
                                 scan_width,
                             scan_top,
                             command_band_rect_.right - button_padding_right,
                             scan_top + button_height);
+  copy_summary_button_rect_.SetRect(
+      command_band_rect_.right - button_padding_right - summary_width,
+      scan_button_rect_.bottom + ScaleForDpi(dpi_, 10),
+      command_band_rect_.right - button_padding_right,
+      scan_button_rect_.bottom + ScaleForDpi(dpi_, 10) + button_height);
 
   const auto delete_width = ScaleForDpi(dpi_, 114);
   const auto move_width = ScaleForDpi(dpi_, 156);
   const auto select_width = ScaleForDpi(dpi_, 122);
+  const auto settings_width = ScaleForDpi(dpi_, 112);
   const auto button_top = action_rail_rect_.bottom - ScaleForDpi(dpi_, 22) -
                           button_height;
 
-  delete_button_rect_.SetRect(action_rail_rect_.right - button_padding_right -
-                                  delete_width,
+  settings_button_rect_.SetRect(action_rail_rect_.right - button_padding_right -
+                                    settings_width,
                               button_top,
                               action_rail_rect_.right - button_padding_right,
+                              button_top + button_height);
+  delete_button_rect_.SetRect(settings_button_rect_.left - button_gap -
+                                  delete_width,
+                              button_top,
+                              settings_button_rect_.left - button_gap,
                               button_top + button_height);
   move_to_temp_button_rect_.SetRect(delete_button_rect_.left - button_gap -
                                         move_width,
@@ -2216,7 +3408,6 @@ void MainFrame::LayoutChildren() {
 
   auto list_rect = list_frame_rect_;
   list_rect.DeflateRect(1, 1);
-  list_rect.top += settle_offset;
   file_list_.SetWindowPos(nullptr, list_rect.left, list_rect.top,
                           list_rect.Width(), list_rect.Height(),
                           SWP_NOACTIVATE | SWP_NOZORDER);
@@ -2265,8 +3456,7 @@ void MainFrame::RefreshChrome(bool pulse_selection, bool relayout) {
 }
 
 void MainFrame::BeginSettleAnimation() {
-  reveal_progress_ = 0;
-  EnsureAnimationTimer();
+  reveal_progress_ = 100;
 }
 
 void MainFrame::EnsureAnimationTimer() {
@@ -2274,7 +3464,8 @@ void MainFrame::EnsureAnimationTimer() {
   const auto should_run = reveal_progress_ < 100 ||
                           action_progress_ != action_target ||
                           selected_flash_ > 0 || moved_flash_ > 0 ||
-                          deleted_flash_ > 0 || scan_flash_ > 0;
+                          deleted_flash_ > 0 || scan_flash_ > 0 ||
+                          share_feedback_deadline_ != 0;
   if (should_run) {
     SetTimer(kAnimationTimerId, 15);
   } else {
@@ -2283,8 +3474,10 @@ void MainFrame::EnsureAnimationTimer() {
 }
 
 int MainFrame::GetButtonAtPoint(CPoint point) const {
-  const std::array<int, 4> buttons{{
+  const std::array<int, 6> buttons{{
       kButtonScan,
+      kButtonCopySummary,
+      kButtonSettings,
       kButtonSelectAll,
       kButtonMoveToTemp,
       kButtonDelete,
@@ -2304,6 +3497,10 @@ CRect MainFrame::GetButtonRect(int command_id) const {
   switch (command_id) {
     case kButtonScan:
       return scan_button_rect_;
+    case kButtonCopySummary:
+      return copy_summary_button_rect_;
+    case kButtonSettings:
+      return settings_button_rect_;
     case kButtonSelectAll:
       return select_all_button_rect_;
     case kButtonMoveToTemp:
@@ -2322,6 +3519,10 @@ bool MainFrame::IsButtonEnabled(int command_id) const {
 
   switch (command_id) {
     case kButtonScan:
+      return true;
+    case kButtonCopySummary:
+      return has_last_scan_ && last_scan_succeeded_;
+    case kButtonSettings:
       return true;
     case kButtonSelectAll:
       return file_list_.IsWindow() && file_list_.GetItemCount() > 0;
@@ -2402,6 +3603,12 @@ void MainFrame::DrawSurfaceButton(CDCHandle dc, const CRect& rect,
     case kButtonScan:
       label = L"Scan";
       break;
+    case kButtonCopySummary:
+      label = L"Copy Summary";
+      break;
+    case kButtonSettings:
+      label = L"Settings";
+      break;
     case kButtonSelectAll:
       label = L"Select All";
       break;
@@ -2438,11 +3645,9 @@ void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) const {
   FillRectColor(dc, rect, kCommandBandBackground);
 
   const auto old_mode = dc.SetBkMode(TRANSPARENT);
-  const auto settle_offset =
-      MulDiv(ScaleForDpi(dpi_, 10), 100 - reveal_progress_, 100);
   auto text_rect = rect;
   text_rect.left += ScaleForDpi(dpi_, 28);
-  text_rect.top += ScaleForDpi(dpi_, 22) + settle_offset;
+  text_rect.top += ScaleForDpi(dpi_, 22);
   text_rect.right = scan_button_rect_.left - ScaleForDpi(dpi_, 28);
 
   auto label_rect = text_rect;
@@ -2492,6 +3697,7 @@ void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) const {
   divider_rect.top = rect.bottom - 1;
   FillRectColor(dc, divider_rect, kDividerColor);
   DrawSurfaceButton(dc, scan_button_rect_, kButtonScan);
+  DrawSurfaceButton(dc, copy_summary_button_rect_, kButtonCopySummary);
 
   dc.SetTextColor(old_color);
   dc.SetBkMode(old_mode);
@@ -2547,8 +3753,7 @@ void MainFrame::PaintActionRail(CDCHandle dc, const CRect& rect) const {
               DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
   auto detail_rect = text_rect;
-  detail_rect.top = state_rect.bottom + ScaleForDpi(dpi_, 6) +
-                    MulDiv(ScaleForDpi(dpi_, 6), action_progress_, 100);
+  detail_rect.top = state_rect.bottom + ScaleForDpi(dpi_, 6);
   detail_rect.bottom = detail_rect.top + ScaleForDpi(dpi_, 20);
   dc.SelectFont(caption_font_);
   dc.SetTextColor(
@@ -2561,6 +3766,7 @@ void MainFrame::PaintActionRail(CDCHandle dc, const CRect& rect) const {
   DrawSurfaceButton(dc, select_all_button_rect_, kButtonSelectAll);
   DrawSurfaceButton(dc, move_to_temp_button_rect_, kButtonMoveToTemp);
   DrawSurfaceButton(dc, delete_button_rect_, kButtonDelete);
+  DrawSurfaceButton(dc, settings_button_rect_, kButtonSettings);
 
   dc.SetTextColor(old_color);
   dc.SetBkMode(old_mode);
@@ -2661,6 +3867,10 @@ CString MainFrame::BuildScanStateLine() const {
     return CString(L"Scanning Windows Installer cache...");
   }
 
+  if (share_feedback_deadline_ != 0) {
+    return CString(L"Share-ready summary copied to clipboard");
+  }
+
   if (!has_last_scan_) {
     return CString(L"Ready to scan the Windows Installer cache.");
   }
@@ -2671,6 +3881,11 @@ CString MainFrame::BuildScanStateLine() const {
                       static_cast<LPCWSTR>(FormatClockTime(last_scan_time_)),
                       total_reclaimable_count_,
                       total_reclaimable_count_ == 1 ? L"" : L"s");
+    if (excluded_count_ > 0) {
+      CString excluded_text;
+      excluded_text.Format(L" | %d excluded by filters", excluded_count_);
+      state_line.Append(excluded_text);
+    }
   } else {
     state_line.Format(L"Last scan %s | scan could not complete safely",
                       static_cast<LPCWSTR>(FormatClockTime(last_scan_time_)));
@@ -2683,6 +3898,11 @@ CString MainFrame::BuildScanDetailLine() const {
   if (busy_operation_ == BusyOperation::kScanning) {
     return CString(L"Reviewing MSI and MSP files while keeping the window "
                    L"responsive.");
+  }
+
+  if (share_feedback_deadline_ != 0) {
+    return CString(L"Paste it into email, Slack, forums, or a social post "
+                   L"with the Patch Cleaner link included.");
   }
 
   if (!has_last_scan_) {
@@ -2699,6 +3919,16 @@ CString MainFrame::BuildScanDetailLine() const {
   detail_line.Format(L"%s reclaimable across the current scan.",
                      static_cast<LPCWSTR>(
                          FormatSizeString(total_reclaimable_size_)));
+  if (excluded_count_ > 0) {
+    detail_line.Format(L"%s reclaimable after excluding %d file%s (%s).",
+                       static_cast<LPCWSTR>(
+                           FormatSizeString(total_reclaimable_size_)),
+                       excluded_count_, excluded_count_ == 1 ? L"" : L"s",
+                       static_cast<LPCWSTR>(FormatSizeString(excluded_size_)));
+  } else if (!exclusion_filters_.empty() && !deep_scan_enabled_) {
+    detail_line.Append(
+        L" Deep Scan is off, so filters currently match file paths only.");
+  }
   return detail_line;
 }
 
@@ -2744,6 +3974,45 @@ CString MainFrame::BuildSelectionDetailLine() const {
                      static_cast<LPCWSTR>(FormatSizeString(deleted_size_)),
                      kTempMoveDirectory);
   return detail_line;
+}
+
+std::wstring MainFrame::BuildShareSummaryText() const {
+  CString summary;
+  if (has_last_scan_ && last_scan_succeeded_) {
+    summary.Format(
+        L"Patch Cleaner found %d reclaimable Windows Installer file%s (%s) "
+        L"on this PC.",
+        total_reclaimable_count_, total_reclaimable_count_ == 1 ? L"" : L"s",
+        static_cast<LPCWSTR>(FormatSizeString(total_reclaimable_size_)));
+
+    if (selected_count_ > 0) {
+      CString selection_summary;
+      selection_summary.Format(L" I have %d file%s (%s) selected for cleanup.",
+                               selected_count_,
+                               selected_count_ == 1 ? L"" : L"s",
+                               static_cast<LPCWSTR>(
+                                   FormatSizeString(selected_size_)));
+      summary.Append(selection_summary);
+    } else {
+      summary.Append(L" Reviewing the leftovers before cleaning them up.");
+    }
+  } else {
+    summary.Append(
+        L"I'm using Patch Cleaner to review leftover Windows Installer files "
+        L"before cleanup.");
+  }
+
+  const auto cleaned_size = moved_size_ + deleted_size_;
+  if (cleaned_size > 0) {
+    CString cleaned_summary;
+    cleaned_summary.Format(L" Cleaned %s so far.",
+                           static_cast<LPCWSTR>(FormatSizeString(cleaned_size)));
+    summary.Append(cleaned_summary);
+  }
+
+  summary.Append(L" ");
+  summary.Append(kShareProductUrl);
+  return std::wstring(summary.GetString());
 }
 
 LRESULT MainFrame::OnCustomDraw(NMHDR* header) {

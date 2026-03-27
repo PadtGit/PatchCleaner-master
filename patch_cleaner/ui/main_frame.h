@@ -4,6 +4,8 @@
 #define PATCH_CLEANER_UI_MAIN_FRAME_H_
 
 #include <stdint.h>
+#include <string>
+#include <vector>
 
 #pragma warning(push, 3)
 #include <atlbase.h>
@@ -21,6 +23,14 @@
 
 #ifndef ID_FILE_MOVE_TO_TEMP
 #define ID_FILE_MOVE_TO_TEMP 40001
+#endif
+
+#ifndef ID_EDIT_COPY_SUMMARY
+#define ID_EDIT_COPY_SUMMARY 40002
+#endif
+
+#ifndef ID_APP_SETTINGS
+#define ID_APP_SETTINGS 40003
 #endif
 
 namespace patch_cleaner {
@@ -55,6 +65,8 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
 
     COMMAND_ID_HANDLER_EX(ID_FILE_UPDATE, OnFileUpdate)
     COMMAND_ID_HANDLER_EX(ID_EDIT_SELECT_ALL, OnEditSelectAll)
+    COMMAND_ID_HANDLER_EX(ID_EDIT_COPY_SUMMARY, OnEditCopySummary)
+    COMMAND_ID_HANDLER_EX(ID_APP_SETTINGS, OnAppSettings)
     COMMAND_ID_HANDLER_EX(ID_FILE_MOVE_TO_TEMP, OnFileMoveToTemp)
     COMMAND_ID_HANDLER_EX(ID_EDIT_DELETE, OnEditDelete)
 
@@ -76,6 +88,8 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   enum SurfaceButtons {
     kButtonScan = ID_FILE_UPDATE,
     kButtonSelectAll = ID_EDIT_SELECT_ALL,
+    kButtonCopySummary = ID_EDIT_COPY_SUMMARY,
+    kButtonSettings = ID_APP_SETTINGS,
     kButtonMoveToTemp = ID_FILE_MOVE_TO_TEMP,
     kButtonDelete = ID_EDIT_DELETE,
   };
@@ -104,6 +118,8 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
 
   void OnFileUpdate(UINT notify_code, int id, CWindow control);
   void OnEditSelectAll(UINT notify_code, int id, CWindow control);
+  void OnEditCopySummary(UINT notify_code, int id, CWindow control);
+  void OnAppSettings(UINT notify_code, int id, CWindow control);
   void OnFileMoveToTemp(UINT notify_code, int id, CWindow control);
   void OnEditDelete(UINT notify_code, int id, CWindow control);
   void ApplySort();
@@ -135,6 +151,7 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   CString BuildScanDetailLine() const;
   CString BuildSelectionStateLine() const;
   CString BuildSelectionDetailLine() const;
+  std::wstring BuildShareSummaryText() const;
   static int CALLBACK CompareFileItems(LPARAM left, LPARAM right,
                                        LPARAM context);
 
@@ -144,8 +161,10 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   uint64_t selected_size_;
   uint64_t moved_size_;
   uint64_t deleted_size_;
+  uint64_t excluded_size_;
   uint64_t total_reclaimable_size_;
   int selected_count_;
+  int excluded_count_;
   int total_reclaimable_count_;
   int sort_column_;
   int hot_button_;
@@ -164,13 +183,19 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   bool tracking_mouse_;
   bool has_last_scan_;
   bool last_scan_succeeded_;
+  bool deep_scan_enabled_;
+  bool missing_files_check_on_startup_;
   bool recovered_last_operation_;
   BusyOperation busy_operation_;
+  ULONGLONG share_feedback_deadline_;
   SYSTEMTIME last_scan_time_;
+  std::vector<std::wstring> exclusion_filters_;
   CRect command_band_rect_;
   CRect list_frame_rect_;
   CRect action_rail_rect_;
   CRect scan_button_rect_;
+  CRect copy_summary_button_rect_;
+  CRect settings_button_rect_;
   CRect select_all_button_rect_;
   CRect move_to_temp_button_rect_;
   CRect delete_button_rect_;
