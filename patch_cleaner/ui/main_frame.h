@@ -33,6 +33,10 @@
 #define ID_APP_SETTINGS 40003
 #endif
 
+#ifndef ID_VIEW_FILE_DETAILS
+#define ID_VIEW_FILE_DETAILS 40004
+#endif
+
 namespace patch_cleaner {
 namespace ui {
 
@@ -52,6 +56,7 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
     MSG_WM_ERASEBKGND(OnEraseBkgnd)
     MSG_WM_MOUSEMOVE(OnMouseMove)
     MSG_WM_MOUSELEAVE(OnMouseLeave)
+    MSG_WM_SETCURSOR(OnSetCursor)
     MSG_WM_LBUTTONDOWN(OnLButtonDown)
     MSG_WM_LBUTTONUP(OnLButtonUp)
     MSG_WM_TIMER(OnTimer)
@@ -67,6 +72,7 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
     COMMAND_ID_HANDLER_EX(ID_EDIT_SELECT_ALL, OnEditSelectAll)
     COMMAND_ID_HANDLER_EX(ID_EDIT_COPY_SUMMARY, OnEditCopySummary)
     COMMAND_ID_HANDLER_EX(ID_APP_SETTINGS, OnAppSettings)
+    COMMAND_ID_HANDLER_EX(ID_VIEW_FILE_DETAILS, OnViewFileDetails)
     COMMAND_ID_HANDLER_EX(ID_FILE_MOVE_TO_TEMP, OnFileMoveToTemp)
     COMMAND_ID_HANDLER_EX(ID_EDIT_DELETE, OnEditDelete)
 
@@ -103,6 +109,7 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   BOOL OnEraseBkgnd(CDCHandle dc);
   void OnMouseMove(UINT flags, CPoint point);
   void OnMouseLeave();
+  BOOL OnSetCursor(CWindow window, UINT hit_test, UINT message);
   void OnLButtonDown(UINT flags, CPoint point);
   void OnLButtonUp(UINT flags, CPoint point);
   void OnTimer(UINT_PTR event_id);
@@ -120,6 +127,7 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   void OnEditSelectAll(UINT notify_code, int id, CWindow control);
   void OnEditCopySummary(UINT notify_code, int id, CWindow control);
   void OnAppSettings(UINT notify_code, int id, CWindow control);
+  void OnViewFileDetails(UINT notify_code, int id, CWindow control);
   void OnFileMoveToTemp(UINT notify_code, int id, CWindow control);
   void OnEditDelete(UINT notify_code, int id, CWindow control);
   void ApplySort();
@@ -137,14 +145,17 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   void EnsureAnimationTimer();
   int GetButtonAtPoint(CPoint point) const;
   CRect GetButtonRect(int command_id) const;
+  bool IsDetailsLinkEnabled() const;
   bool IsButtonEnabled(int command_id) const;
   void UpdateHotButton(int command_id);
+  void UpdateHotDetailsLink(bool hot);
   void InvokeSurfaceButton(int command_id);
+  void InvokeDetailsLink();
   void DrawSurfaceButton(CDCHandle dc, const CRect& rect, int command_id) const;
   void PaintChrome(CDCHandle dc);
-  void PaintCommandBand(CDCHandle dc, const CRect& rect) const;
+  void PaintCommandBand(CDCHandle dc, const CRect& rect);
   void PaintListFrame(CDCHandle dc, const CRect& rect) const;
-  void PaintActionRail(CDCHandle dc, const CRect& rect) const;
+  void PaintActionRail(CDCHandle dc, const CRect& rect);
   LRESULT PaintHeaderCustomDraw(NMCUSTOMDRAW* draw);
   LRESULT PaintListCustomDraw(NMLVCUSTOMDRAW* draw);
   CString BuildScanStateLine() const;
@@ -152,6 +163,7 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   CString BuildSelectionStateLine() const;
   CString BuildSelectionDetailLine() const;
   std::wstring BuildShareSummaryText() const;
+  int GetDetailsTargetIndex() const;
   static int CALLBACK CompareFileItems(LPARAM left, LPARAM right,
                                        LPARAM context);
 
@@ -199,12 +211,15 @@ class MainFrame : public CFrameWindowImpl<MainFrame>, private CMessageFilter {
   CRect select_all_button_rect_;
   CRect move_to_temp_button_rect_;
   CRect delete_button_rect_;
+  CRect details_link_rect_;
   CFont headline_font_;
   CFont title_font_;
   CFont body_font_;
   CFont caption_font_;
   CFont button_font_;
   CListViewCtrl file_list_;
+  bool hot_details_link_;
+  bool pressed_details_link_;
 
   MainFrame(const MainFrame&) = delete;
   MainFrame& operator=(const MainFrame&) = delete;

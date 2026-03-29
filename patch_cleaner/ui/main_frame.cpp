@@ -1537,6 +1537,497 @@ std::wstring BuildDeepScanMetadata(const std::wstring& path) {
   return metadata;
 }
 
+std::wstring ExtractFileName(const std::wstring& path) {
+  const auto separator_index = path.find_last_of(L"\\/");
+  if (separator_index == std::wstring::npos) {
+    return path;
+  }
+
+  return path.substr(separator_index + 1);
+}
+
+std::wstring ValueOrFallback(const std::wstring& value,
+                             const wchar_t* fallback) {
+  return value.empty() ? std::wstring(fallback) : value;
+}
+
+struct FileDetailsModel {
+  std::wstring file_name;
+  std::wstring file_path;
+  std::wstring title;
+  std::wstring subject;
+  std::wstring author;
+  std::wstring digital_signature;
+  std::wstring file_size;
+  std::wstring comment;
+};
+
+FileDetailsModel BuildFileDetailsModel(const FileItem& item) {
+  FileDetailsModel model;
+  model.file_name = ExtractFileName(item.path);
+  model.file_path = item.path;
+
+  std::wstring title;
+  ReadSummaryPropertyString(item.path, PID_TITLE, &title);
+  model.title = ValueOrFallback(title, L"Not available");
+
+  std::wstring subject;
+  ReadSummaryPropertyString(item.path, PID_SUBJECT, &subject);
+  model.subject = ValueOrFallback(subject, L"Not available");
+
+  std::wstring author;
+  ReadSummaryPropertyString(item.path, PID_AUTHOR, &author);
+  model.author = ValueOrFallback(author, L"Not available");
+
+  std::wstring comment;
+  ReadSummaryPropertyString(item.path, PID_COMMENTS, &comment);
+  model.comment = ValueOrFallback(comment, L"No summary comment provided.");
+
+  model.digital_signature =
+      ValueOrFallback(GetSignerDisplayName(item.path),
+                      L"Not signed or certificate details unavailable.");
+  model.file_size = std::wstring(FormatSizeString(item.size).GetString());
+  if (model.file_name.empty()) {
+    model.file_name = model.file_path;
+  }
+  return model;
+}
+
+constexpr int kFileDetailsDialogWidth = 696;
+constexpr int kFileDetailsDialogHeight = 496;
+
+class FileDetailsDialog : public CWindowImpl<FileDetailsDialog> {
+ public:
+  DECLARE_WND_CLASS(L"PatchCleanerFileDetailsWindow")
+
+  explicit FileDetailsDialog(const FileDetailsModel& details)
+      : details_(details), modal_result_(0), dpi_(kDefaultDpi) {}
+
+  int DoModal(HWND owner_window) {
+    dpi_ = GetWindowDpi(owner_window);
+
+    RECT bounds{0, 0, ScaleForDpi(dpi_, kFileDetailsDialogWidth),
+                ScaleForDpi(dpi_, kFileDetailsDialogHeight)};
+    AdjustWindowRectEx(&bounds, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE,
+                       WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT);
+
+    if (Create(owner_window, bounds, L"PatchCleaner - File Details",
+               WS_POPUP | WS_CAPTION | WS_SYSMENU,
+               WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT) == nullptr) {
+      return IDCANCEL;
+    }
+
+    if (owner_window != nullptr) {
+      ::EnableWindow(owner_window, FALSE);
+    }
+
+    CenterWindow(owner_window);
+    ShowWindow(SW_SHOWNORMAL);
+    SetForegroundWindow(m_hWnd);
+
+    MSG message{};
+    while (modal_result_ == 0 && IsWindow()) {
+      const auto message_result = GetMessage(&message, nullptr, 0, 0);
+      if (message_result <= 0) {
+        modal_result_ = IDCANCEL;
+        break;
+      }
+
+      if (!IsDialogMessage(&message)) {
+        TranslateMessage(&message);
+        DispatchMessage(&message);
+      }
+    }
+
+    if (IsWindow()) {
+      DestroyWindow();
+    }
+
+    if (owner_window != nullptr && ::IsWindow(owner_window)) {
+      ::EnableWindow(owner_window, TRUE);
+      ::SetActiveWindow(owner_window);
+      ::SetForegroundWindow(owner_window);
+    }
+
+    return modal_result_ == 0 ? IDCANCEL : modal_result_;
+  }
+
+  BEGIN_MSG_MAP(FileDetailsDialog)
+    MSG_WM_CREATE(OnCreate)
+    MSG_WM_CLOSE(OnClose)
+    MSG_WM_DESTROY(OnDestroy)
+    MSG_WM_PAINT(OnPaint)
+    MSG_WM_ERASEBKGND(OnEraseBkgnd)
+    COMMAND_ID_HANDLER_EX(IDCANCEL, OnCloseCommand)
+    MESSAGE_HANDLER(WM_DRAWITEM, OnDrawItem)
+    MESSAGE_HANDLER(WM_CTLCOLORDLG, OnCtlColorDialog)
+    MESSAGE_HANDLER(WM_CTLCOLORSTATIC, OnCtlColorStatic)
+    MESSAGE_HANDLER(WM_CTLCOLOREDIT, OnCtlColorEdit)
+  END_MSG_MAP()
+
+ private:
+  int OnCreate(CREATESTRUCT* /*create*/) {
+    InitializeFonts();
+
+    background_brush_.CreateSolidBrush(kSettingsDialogBackground);
+    panel_brush_.CreateSolidBrush(kSettingsDialogPanelBackground);
+    footer_brush_.CreateSolidBrush(kSettingsDialogFooterBackground);
+    input_brush_.CreateSolidBrush(kSettingsDialogInputBackground);
+
+    const auto scale = [&](int value) { return ScaleForDpi(dpi_, value); };
+    const auto apply_font = [&](HWND window, HFONT font) {
+      if (window != nullptr) {
+        SendMessage(window, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+      }
+    };
+    const auto create_static = [&](const wchar_t* text, DWORD style, int x,
+                                   int y, int width, int height,
+                                   HFONT font) -> HWND {
+      HWND window = ::CreateWindowExW(
+          0, L"STATIC", text,
+          WS_CHILD | WS_VISIBLE | style | SS_LEFT,
+          scale(x), scale(y), scale(width), scale(height), m_hWnd, nullptr,
+          _AtlBaseModule.GetModuleInstance(), nullptr);
+      apply_font(window, font);
+      return window;
+    };
+    const auto create_edit = [&](const std::wstring& text, DWORD style, int x,
+                                 int y, int width, int height,
+                                 HFONT font) -> HWND {
+      HWND window = ::CreateWindowExW(
+          WS_EX_CLIENTEDGE, L"EDIT", text.c_str(),
+          WS_CHILD | WS_VISIBLE | style,
+          scale(x), scale(y), scale(width), scale(height), m_hWnd, nullptr,
+          _AtlBaseModule.GetModuleInstance(), nullptr);
+      apply_font(window, font);
+      return window;
+    };
+    const auto create_button = [&](const wchar_t* text, DWORD style, int x,
+                                   int y, int width, int height, int control_id,
+                                   HFONT font) -> HWND {
+      HWND window = ::CreateWindowExW(
+          0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | style,
+          scale(x), scale(y), scale(width), scale(height), m_hWnd,
+          reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
+          _AtlBaseModule.GetModuleInstance(), nullptr);
+      apply_font(window, font);
+      return window;
+    };
+
+    eyebrow_.Attach(create_static(L"ORPHANED FILE DETAILS", 0, 28, 24, 220, 16,
+                                  heading_font_));
+    title_.Attach(create_static(details_.file_name.c_str(), 0, 28, 44, 620, 30,
+                                title_font_));
+    path_value_.Attach(create_edit(details_.file_path,
+                                   ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL,
+                                   28, 78, 636, 24, body_font_));
+
+    title_label_.Attach(
+        create_static(L"Title", SS_RIGHT, 28, 150, 100, 18, label_font_));
+    title_value_.Attach(create_edit(details_.title,
+                                    ES_AUTOHSCROLL | ES_READONLY |
+                                        ES_NOHIDESEL,
+                                    142, 144, 522, 28, body_font_));
+
+    subject_label_.Attach(
+        create_static(L"Subject", SS_RIGHT, 28, 188, 100, 18, label_font_));
+    subject_value_.Attach(create_edit(details_.subject,
+                                      ES_MULTILINE | ES_AUTOVSCROLL |
+                                          ES_READONLY | ES_NOHIDESEL |
+                                          WS_VSCROLL,
+                                      142, 182, 522, 44, body_font_));
+
+    author_label_.Attach(
+        create_static(L"Author", SS_RIGHT, 28, 242, 100, 18, label_font_));
+    author_value_.Attach(create_edit(details_.author,
+                                     ES_AUTOHSCROLL | ES_READONLY |
+                                         ES_NOHIDESEL,
+                                     142, 236, 522, 28, body_font_));
+
+    signature_label_.Attach(create_static(L"Digital Signature", SS_RIGHT, 12,
+                                          282, 116, 18, label_font_));
+    signature_value_.Attach(create_edit(
+        details_.digital_signature,
+        ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | ES_NOHIDESEL |
+            WS_VSCROLL,
+        142, 276, 522, 76, body_font_));
+
+    size_label_.Attach(
+        create_static(L"File Size", SS_RIGHT, 28, 368, 100, 18, label_font_));
+    size_value_.Attach(create_edit(details_.file_size,
+                                   ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL,
+                                   142, 362, 210, 28, body_font_));
+
+    comment_label_.Attach(
+        create_static(L"Comment", SS_RIGHT, 28, 404, 100, 18, label_font_));
+    comment_value_.Attach(create_edit(details_.comment,
+                                      ES_MULTILINE | ES_AUTOVSCROLL |
+                                          ES_READONLY | ES_NOHIDESEL |
+                                          WS_VSCROLL,
+                                      142, 398, 522, 42, body_font_));
+
+    close_button_.Attach(create_button(L"Close", BS_OWNERDRAW | WS_TABSTOP,
+                                       576, 444, 88, 32, IDCANCEL,
+                                       button_font_));
+    return 0;
+  }
+
+  void OnClose() {
+    EndModal(IDCANCEL);
+  }
+
+  void OnDestroy() {
+    if (!heading_font_.IsNull()) {
+      heading_font_.DeleteObject();
+    }
+    if (!title_font_.IsNull()) {
+      title_font_.DeleteObject();
+    }
+    if (!label_font_.IsNull()) {
+      label_font_.DeleteObject();
+    }
+    if (!body_font_.IsNull()) {
+      body_font_.DeleteObject();
+    }
+    if (!button_font_.IsNull()) {
+      button_font_.DeleteObject();
+    }
+    if (!background_brush_.IsNull()) {
+      background_brush_.DeleteObject();
+    }
+    if (!panel_brush_.IsNull()) {
+      panel_brush_.DeleteObject();
+    }
+    if (!footer_brush_.IsNull()) {
+      footer_brush_.DeleteObject();
+    }
+    if (!input_brush_.IsNull()) {
+      input_brush_.DeleteObject();
+    }
+  }
+
+  void OnPaint(CDCHandle dc) {
+    CDCHandle target_dc(dc);
+    if (target_dc == nullptr) {
+      CPaintDC paint_dc(m_hWnd);
+      OnPaint(paint_dc.m_hDC);
+      return;
+    }
+
+    CRect client_rect;
+    GetClientRect(&client_rect);
+    if (client_rect.IsRectEmpty()) {
+      return;
+    }
+
+    const auto scale = [&](int value) { return ScaleForDpi(dpi_, value); };
+    FillRectColor(target_dc, client_rect, kSettingsDialogBackground);
+
+    CRect top_panel(scale(16), scale(14), client_rect.right - scale(16),
+                    scale(114));
+    FillRoundedRect(target_dc, top_panel, kSettingsDialogPanelBackground,
+                    BlendColor(kSettingsDialogBorder, kSettingsDialogAccent, 14),
+                    scale(18));
+
+    CRect top_rule = top_panel;
+    top_rule.left += scale(18);
+    top_rule.right -= scale(18);
+    top_rule.top += scale(12);
+    top_rule.bottom = top_rule.top + scale(3);
+    FillRectColor(target_dc, top_rule, kSettingsDialogAccent);
+
+    CRect content_panel(scale(16), scale(126), client_rect.right - scale(16),
+                        scale(436));
+    FillRoundedRect(target_dc, content_panel, kSettingsDialogPanelBackground,
+                    kSettingsDialogBorder, scale(18));
+
+    CRect footer_panel(scale(16), scale(438), client_rect.right - scale(16),
+                       client_rect.bottom - scale(16));
+    FillRoundedRect(target_dc, footer_panel, kSettingsDialogFooterBackground,
+                    kSettingsDialogBorder, scale(18));
+  }
+
+  BOOL OnEraseBkgnd(CDCHandle /*dc*/) {
+    return TRUE;
+  }
+
+  void OnCloseCommand(UINT /*notify_code*/, int /*id*/, CWindow /*control*/) {
+    EndModal(IDCANCEL);
+  }
+
+  LRESULT OnDrawItem(UINT /*message*/, WPARAM /*w_param*/, LPARAM l_param,
+                     BOOL& handled) {
+    handled = TRUE;
+
+    const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
+    if (draw == nullptr || draw->CtlType != ODT_BUTTON ||
+        draw->CtlID != IDCANCEL) {
+      handled = FALSE;
+      return 0;
+    }
+
+    const auto scale = [&](int value) { return ScaleForDpi(dpi_, value); };
+    const auto hot = (draw->itemState & ODS_HOTLIGHT) != 0;
+    const auto pressed = (draw->itemState & ODS_SELECTED) != 0;
+
+    COLORREF fill_color = hot
+                              ? BlendColor(kSettingsDialogFooterBackground,
+                                           kSettingsDialogAccent, 10)
+                              : kSettingsDialogFooterBackground;
+    COLORREF border_color = hot
+                                ? BlendColor(kSettingsDialogBorder,
+                                             kSettingsDialogAccent, 40)
+                                : kSettingsDialogBorder;
+    auto text_color = kSettingsDialogText;
+    if (pressed) {
+      fill_color = BlendColor(fill_color, RGB(32, 28, 24), 10);
+      border_color = BlendColor(border_color, RGB(32, 28, 24), 12);
+    }
+
+    CDCHandle control_dc(draw->hDC);
+    CRect rect(draw->rcItem);
+    FillRoundedRect(control_dc, rect, fill_color, border_color, scale(12));
+
+    const auto old_font = control_dc.SelectFont(button_font_);
+    const auto old_mode = control_dc.SetBkMode(TRANSPARENT);
+    const auto old_color = control_dc.SetTextColor(text_color);
+    CRect text_rect(rect);
+    control_dc.DrawText(L"Close", -1, &text_rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    control_dc.SetTextColor(old_color);
+    control_dc.SetBkMode(old_mode);
+    control_dc.SelectFont(old_font);
+
+    if ((draw->itemState & ODS_FOCUS) != 0) {
+      CRect focus_rect(rect);
+      focus_rect.DeflateRect(scale(4), scale(4));
+      control_dc.DrawFocusRect(&focus_rect);
+    }
+
+    return TRUE;
+  }
+
+  LRESULT OnCtlColorDialog(UINT /*message*/, WPARAM w_param, LPARAM /*l_param*/,
+                           BOOL& handled) {
+    handled = TRUE;
+    SetBkColor(reinterpret_cast<HDC>(w_param), kSettingsDialogBackground);
+    return reinterpret_cast<LRESULT>(background_brush_.m_hBrush);
+  }
+
+  LRESULT OnCtlColorStatic(UINT /*message*/, WPARAM w_param, LPARAM l_param,
+                           BOOL& handled) {
+    handled = TRUE;
+    const auto child_window = reinterpret_cast<HWND>(l_param);
+    if (IsValueWindow(child_window)) {
+      SetTextColor(reinterpret_cast<HDC>(w_param), kSettingsDialogText);
+      SetBkColor(reinterpret_cast<HDC>(w_param), kSettingsDialogInputBackground);
+      return reinterpret_cast<LRESULT>(input_brush_.m_hBrush);
+    }
+
+    auto text_color = kSettingsDialogText;
+    if (child_window == eyebrow_.m_hWnd) {
+      text_color = kSettingsDialogAccent;
+    } else if (child_window == title_.m_hWnd) {
+      text_color = kSettingsDialogText;
+    } else if (child_window == title_label_.m_hWnd ||
+               child_window == subject_label_.m_hWnd ||
+               child_window == author_label_.m_hWnd ||
+               child_window == signature_label_.m_hWnd ||
+               child_window == size_label_.m_hWnd ||
+               child_window == comment_label_.m_hWnd) {
+      text_color = kSettingsDialogAccentDark;
+    }
+
+    SetTextColor(reinterpret_cast<HDC>(w_param), text_color);
+    SetBkMode(reinterpret_cast<HDC>(w_param), TRANSPARENT);
+    return reinterpret_cast<LRESULT>(GetSectionBrush(child_window));
+  }
+
+  LRESULT OnCtlColorEdit(UINT /*message*/, WPARAM w_param, LPARAM /*l_param*/,
+                         BOOL& handled) {
+    handled = TRUE;
+    SetTextColor(reinterpret_cast<HDC>(w_param), kSettingsDialogText);
+    SetBkColor(reinterpret_cast<HDC>(w_param), kSettingsDialogInputBackground);
+    return reinterpret_cast<LRESULT>(input_brush_.m_hBrush);
+  }
+
+  void InitializeFonts() {
+    const auto base_font = BuildBaseUiFont();
+    const auto create_font = [&](CFont* font, int point_size, LONG weight) {
+      LOGFONT face = base_font;
+      face.lfHeight = -MulDiv(point_size, static_cast<int>(dpi_), 72);
+      face.lfWeight = weight;
+      face.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+      font->CreateFontIndirect(&face);
+    };
+
+    create_font(&heading_font_, 9, FW_SEMIBOLD);
+    create_font(&title_font_, 22, FW_SEMIBOLD);
+    create_font(&label_font_, 10, FW_SEMIBOLD);
+    create_font(&body_font_, 10, FW_NORMAL);
+    create_font(&button_font_, 10, FW_SEMIBOLD);
+  }
+
+  bool IsValueWindow(HWND window) const {
+    return window == path_value_.m_hWnd || window == title_value_.m_hWnd ||
+           window == subject_value_.m_hWnd || window == author_value_.m_hWnd ||
+           window == signature_value_.m_hWnd || window == size_value_.m_hWnd ||
+           window == comment_value_.m_hWnd;
+  }
+
+  HBRUSH GetSectionBrush(HWND child_window) const {
+    if (child_window == nullptr) {
+      return background_brush_.m_hBrush;
+    }
+
+    RECT child_rect{};
+    if (!::GetWindowRect(child_window, &child_rect) ||
+        !::MapWindowPoints(HWND_DESKTOP, m_hWnd,
+                           reinterpret_cast<POINT*>(&child_rect), 2)) {
+      return background_brush_.m_hBrush;
+    }
+
+    return child_rect.top >= ScaleForDpi(dpi_, 438) ? footer_brush_.m_hBrush
+                                                    : panel_brush_.m_hBrush;
+  }
+
+  void EndModal(int result) {
+    modal_result_ = result;
+    if (IsWindow()) {
+      DestroyWindow();
+    }
+  }
+
+  FileDetailsModel details_;
+  int modal_result_;
+  UINT dpi_;
+  CBrush background_brush_;
+  CBrush panel_brush_;
+  CBrush footer_brush_;
+  CBrush input_brush_;
+  CFont heading_font_;
+  CFont title_font_;
+  CFont label_font_;
+  CFont body_font_;
+  CFont button_font_;
+  CWindow eyebrow_;
+  CWindow title_;
+  CWindow title_label_;
+  CWindow subject_label_;
+  CWindow author_label_;
+  CWindow signature_label_;
+  CWindow size_label_;
+  CWindow comment_label_;
+  CEdit path_value_;
+  CEdit title_value_;
+  CEdit subject_value_;
+  CEdit author_value_;
+  CEdit signature_value_;
+  CEdit size_value_;
+  CEdit comment_value_;
+  CButton close_button_;
+};
+
 bool ShouldExcludeFile(const std::wstring& path,
                        const std::vector<std::wstring>& filters,
                        bool deep_scan_enabled) {
@@ -2564,8 +3055,11 @@ MainFrame::MainFrame()
       missing_files_check_on_startup_(false),
       recovered_last_operation_(false),
       busy_operation_(BusyOperation::kNone),
-      share_feedback_deadline_(0) {
+      share_feedback_deadline_(0),
+      hot_details_link_(false),
+      pressed_details_link_(false) {
   ZeroMemory(&last_scan_time_, sizeof(last_scan_time_));
+  details_link_rect_.SetRectEmpty();
 }
 
 BOOL MainFrame::PreTranslateMessage(MSG* message) {
@@ -2686,36 +3180,71 @@ void MainFrame::OnMouseMove(UINT /*flags*/, CPoint point) {
   }
 
   UpdateHotButton(GetButtonAtPoint(point));
+  UpdateHotDetailsLink(IsDetailsLinkEnabled() && details_link_rect_.PtInRect(point));
 }
 
 void MainFrame::OnMouseLeave() {
   tracking_mouse_ = false;
   UpdateHotButton(0);
+  UpdateHotDetailsLink(false);
+}
+
+BOOL MainFrame::OnSetCursor(CWindow /*window*/, UINT hit_test,
+                            UINT /*message*/) {
+  if (hit_test == HTCLIENT) {
+    POINT screen_point{};
+    if (GetCursorPos(&screen_point)) {
+      ScreenToClient(&screen_point);
+      if (IsDetailsLinkEnabled() && details_link_rect_.PtInRect(screen_point)) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return TRUE;
+      }
+    }
+  }
+
+  return FALSE;
 }
 
 void MainFrame::OnLButtonDown(UINT /*flags*/, CPoint point) {
   const auto command_id = GetButtonAtPoint(point);
-  if (command_id == 0) {
-    SetMsgHandled(FALSE);
+  if (command_id != 0) {
+    pressed_button_ = command_id;
+    SetCapture();
+    InvalidateRect(GetButtonRect(command_id), FALSE);
     return;
   }
 
-  pressed_button_ = command_id;
-  SetCapture();
-  InvalidateRect(GetButtonRect(command_id), FALSE);
+  if (IsDetailsLinkEnabled() && details_link_rect_.PtInRect(point)) {
+    pressed_details_link_ = true;
+    SetCapture();
+    InvalidateRect(details_link_rect_, FALSE);
+    return;
+  }
+
+  SetMsgHandled(FALSE);
 }
 
 void MainFrame::OnLButtonUp(UINT /*flags*/, CPoint point) {
   const auto was_pressed = pressed_button_;
+  const auto was_details_link_pressed = pressed_details_link_;
   if (GetCapture() == m_hWnd) {
     ReleaseCapture();
   }
 
   pressed_button_ = 0;
+  pressed_details_link_ = false;
   if (was_pressed != 0) {
     InvalidateRect(GetButtonRect(was_pressed), FALSE);
     if (was_pressed == GetButtonAtPoint(point)) {
       InvokeSurfaceButton(was_pressed);
+    }
+    return;
+  }
+
+  if (was_details_link_pressed) {
+    InvalidateRect(details_link_rect_, FALSE);
+    if (IsDetailsLinkEnabled() && details_link_rect_.PtInRect(point)) {
+      InvokeDetailsLink();
     }
   }
 }
@@ -2952,6 +3481,12 @@ void MainFrame::OnFileUpdate(UINT /*notify_code*/, int /*id*/,
   selected_size_ = 0;
   selected_count_ = 0;
   ApplySort();
+  if (file_list_.GetItemCount() > 0) {
+    file_list_.SetItemState(0, LVIS_SELECTED | LVIS_FOCUSED,
+                            LVIS_SELECTED | LVIS_FOCUSED);
+    file_list_.SetSelectionMark(0);
+    file_list_.EnsureVisible(0, FALSE);
+  }
   scan_flash_ = 100;
   BeginSettleAnimation();
   RefreshChrome(false, true);
@@ -3056,6 +3591,31 @@ void MainFrame::OnAppSettings(UINT /*notify_code*/, int /*id*/,
   if (has_last_scan_) {
     PostMessage(WM_COMMAND, MAKEWPARAM(ID_FILE_UPDATE, 0));
   }
+}
+
+void MainFrame::OnViewFileDetails(UINT /*notify_code*/, int /*id*/,
+                                  CWindow /*control*/) {
+  if (!IsDetailsLinkEnabled()) {
+    return;
+  }
+
+  const auto item_index = GetDetailsTargetIndex();
+  if (item_index < 0) {
+    MessageBox(L"Select an installer result before opening details.",
+               L"Patch Cleaner", MB_ICONINFORMATION | MB_OK);
+    return;
+  }
+
+  const auto* file_item =
+      reinterpret_cast<const FileItem*>(file_list_.GetItemData(item_index));
+  if (file_item == nullptr) {
+    MessageBox(L"Patch Cleaner could not read the selected installer details.",
+               L"Patch Cleaner", MB_ICONERROR | MB_OK);
+    return;
+  }
+
+  FileDetailsDialog dialog(BuildFileDetailsModel(*file_item));
+  dialog.DoModal(m_hWnd);
 }
 
 void MainFrame::OnFileMoveToTemp(UINT /*notify_code*/, int /*id*/,
@@ -3534,6 +4094,12 @@ bool MainFrame::IsButtonEnabled(int command_id) const {
   }
 }
 
+bool MainFrame::IsDetailsLinkEnabled() const {
+  return !IsBusy() && share_feedback_deadline_ == 0 && has_last_scan_ &&
+         last_scan_succeeded_ && file_list_.IsWindow() &&
+         file_list_.GetItemCount() > 0;
+}
+
 void MainFrame::UpdateHotButton(int command_id) {
   if (hot_button_ == command_id) {
     return;
@@ -3549,12 +4115,31 @@ void MainFrame::UpdateHotButton(int command_id) {
   }
 }
 
+void MainFrame::UpdateHotDetailsLink(bool hot) {
+  if (hot_details_link_ == hot) {
+    return;
+  }
+
+  hot_details_link_ = hot;
+  if (!details_link_rect_.IsRectEmpty()) {
+    InvalidateRect(details_link_rect_, FALSE);
+  }
+}
+
 void MainFrame::InvokeSurfaceButton(int command_id) {
   if (!IsButtonEnabled(command_id)) {
     return;
   }
 
   SendMessage(WM_COMMAND, MAKEWPARAM(command_id, 0), 0);
+}
+
+void MainFrame::InvokeDetailsLink() {
+  if (!IsDetailsLinkEnabled()) {
+    return;
+  }
+
+  SendMessage(WM_COMMAND, MAKEWPARAM(ID_VIEW_FILE_DETAILS, 0), 0);
 }
 
 void MainFrame::DrawSurfaceButton(CDCHandle dc, const CRect& rect,
@@ -3635,13 +4220,14 @@ void MainFrame::PaintChrome(CDCHandle dc) {
   CRect client_rect;
   GetClientRect(&client_rect);
 
+  details_link_rect_.SetRectEmpty();
   FillRectColor(dc, client_rect, kWindowBackground);
   PaintCommandBand(dc, command_band_rect_);
   PaintListFrame(dc, list_frame_rect_);
   PaintActionRail(dc, action_rail_rect_);
 }
 
-void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) const {
+void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) {
   FillRectColor(dc, rect, kCommandBandBackground);
 
   const auto old_mode = dc.SetBkMode(TRANSPARENT);
@@ -3682,7 +4268,7 @@ void MainFrame::PaintCommandBand(CDCHandle dc, const CRect& rect) const {
   dc.SetTextColor(BlendColor(kInkColor, kAccentColor, scan_flash_ / 3));
   auto state_line = BuildScanStateLine();
   dc.DrawText(state_line, state_line.GetLength(), &state_rect,
-              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
   auto detail_rect = text_rect;
   detail_rect.top = state_rect.bottom - ScaleForDpi(dpi_, 3);
@@ -3714,7 +4300,7 @@ void MainFrame::PaintListFrame(CDCHandle dc, const CRect& rect) const {
                 BlendColor(kDividerColor, kAccentColor, 18 + scan_flash_ / 8));
 }
 
-void MainFrame::PaintActionRail(CDCHandle dc, const CRect& rect) const {
+void MainFrame::PaintActionRail(CDCHandle dc, const CRect& rect) {
   FillRectColor(dc, rect, kActionRailBackground);
 
   auto top_rule = rect;
@@ -3749,8 +4335,54 @@ void MainFrame::PaintActionRail(CDCHandle dc, const CRect& rect) const {
   auto state_rect = text_rect;
   state_rect.bottom = state_rect.top + ScaleForDpi(dpi_, 22);
   auto selection_line = BuildSelectionStateLine();
-  dc.DrawText(selection_line, selection_line.GetLength(), &state_rect,
-              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+  auto state_text_rect = state_rect;
+  if (IsDetailsLinkEnabled()) {
+    CString link_text(L"details...");
+    CRect link_rect(state_rect);
+    dc.DrawText(link_text, link_text.GetLength(), &link_rect,
+                DT_CALCRECT | DT_SINGLELINE);
+    const auto link_width = link_rect.Width();
+
+    SIZE selection_size{};
+    dc.GetTextExtent(selection_line, selection_line.GetLength(), &selection_size);
+
+    const auto link_gap = ScaleForDpi(dpi_, 10);
+    const auto preferred_left = state_rect.left + selection_size.cx + link_gap;
+    link_rect.left =
+        std::min(std::max(state_rect.left + ScaleForDpi(dpi_, 120),
+                          preferred_left),
+                 std::max(state_rect.left + ScaleForDpi(dpi_, 120),
+                          state_rect.right - link_width));
+    link_rect.right = std::min(state_rect.right, link_rect.left + link_width);
+    state_text_rect.right =
+        std::max(state_text_rect.left, link_rect.left - link_gap);
+    dc.DrawText(selection_line, selection_line.GetLength(), &state_text_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+    const auto link_color =
+        pressed_details_link_
+            ? kAccentDarkColor
+            : (hot_details_link_ ? BlendColor(kAccentDarkColor, kInkColor, 20)
+                                 : kAccentColor);
+    dc.SetTextColor(link_color);
+    dc.DrawText(link_text, link_text.GetLength(), &link_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    CPen underline_pen;
+    underline_pen.CreatePen(PS_SOLID, 1, link_color);
+    const auto old_pen = dc.SelectPen(underline_pen);
+    const auto underline_y = link_rect.bottom - ScaleForDpi(dpi_, 3);
+    dc.MoveTo(link_rect.left, underline_y);
+    dc.LineTo(link_rect.right, underline_y);
+    dc.SelectPen(old_pen);
+
+    details_link_rect_ = link_rect;
+    details_link_rect_.InflateRect(ScaleForDpi(dpi_, 3), ScaleForDpi(dpi_, 2));
+    dc.SetTextColor(old_color);
+  } else {
+    dc.DrawText(selection_line, selection_line.GetLength(), &state_text_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+  }
 
   auto detail_rect = text_rect;
   detail_rect.top = state_rect.bottom + ScaleForDpi(dpi_, 6);
@@ -4013,6 +4645,26 @@ std::wstring MainFrame::BuildShareSummaryText() const {
   summary.Append(L" ");
   summary.Append(kShareProductUrl);
   return std::wstring(summary.GetString());
+}
+
+int MainFrame::GetDetailsTargetIndex() const {
+  if (!file_list_.IsWindow()) {
+    return -1;
+  }
+
+  auto& list = const_cast<CListViewCtrl&>(file_list_);
+  auto item_index = list.GetNextItem(-1, LVNI_SELECTED);
+  if (item_index < 0) {
+    item_index = list.GetSelectionMark();
+  }
+  if (item_index < 0) {
+    item_index = list.GetNextItem(-1, LVNI_FOCUSED);
+  }
+  if (item_index < 0 && list.GetItemCount() > 0) {
+    item_index = 0;
+  }
+
+  return item_index;
 }
 
 LRESULT MainFrame::OnCustomDraw(NMHDR* header) {
