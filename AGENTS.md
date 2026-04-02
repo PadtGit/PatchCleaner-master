@@ -93,6 +93,11 @@
    - Use real commit history for recent-window requests and report empty windows honestly.
    - Do not substitute file timestamps for Git-backed history requests.
 
+## ExecPlans
+
+- When writing complex features or significant refactors, use an ExecPlan from design through implementation.
+- Follow `PLANS.md` from the repository root when creating or updating that ExecPlan.
+
 ## Subagent Roles
 
 - `patchcleaner-orchestrator`: coordinates exploration, implementation, validation, critique, and final reporting.
