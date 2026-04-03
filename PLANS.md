@@ -80,7 +80,7 @@ When a change affects scan results, move to temp, deletion, elevation, file acco
 
 ## Validation is mandatory
 
-Every PatchCleaner ExecPlan must include exact commands and explain why those commands are enough for the change. Run commands from the repo root, which is the directory that contains `PatchCleaner.sln`. In this checkout that directory is `C:\Users\Bob\Documents\PatchCleaner-master`.
+Every PatchCleaner ExecPlan must include exact commands and explain why those commands are enough for the change. Run commands from the repo root, which is the directory that contains `PatchCleaner.sln`. Do not hard-code a machine-specific checkout path into the plan; use `repo root` wording or substitute the active checkout path when capturing a real transcript.
 
 Preferred local build validation:
 
@@ -203,13 +203,13 @@ Copy the structure below into a new Markdown file when writing a plan for this r
 
     State the exact commands to run and the working directory. Update this section as work proceeds. Include short expected transcripts.
 
-        Working directory: C:\Users\Bob\Documents\PatchCleaner-master
+        Working directory: <repo root containing PatchCleaner.sln>
 
         powershell -NoLogo -ExecutionPolicy Bypass -File .\scripts\build-local.ps1 -Configuration Debug -Platform x64
 
         Expected evidence:
         MSBuild: C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe
-        Project: C:\Users\Bob\Documents\PatchCleaner-master\patch_cleaner\PatchCleaner.vcxproj
+        Project: <repo root>\patch_cleaner\PatchCleaner.vcxproj
         Target: Build (Debug|x64)
 
         If the change touches high-risk behavior:
