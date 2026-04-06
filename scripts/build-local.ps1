@@ -5,7 +5,11 @@ param(
   [ValidateSet("x64", "Win32")]
   [string]$Platform = "x64",
 
-  [switch]$Clean
+  [switch]$Clean,
+
+  [switch]$PerformanceSummary,
+
+  [string]$BinaryLogPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -134,9 +138,28 @@ $args = @(
   "/m"
 )
 
+if ($PerformanceSummary) {
+  $args += "/clp:Summary;PerformanceSummary"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($BinaryLogPath)) {
+  $binaryLogDirectory = Split-Path -Parent $BinaryLogPath
+  if (-not [string]::IsNullOrWhiteSpace($binaryLogDirectory) -and -not (Test-Path $binaryLogDirectory)) {
+    New-Item -ItemType Directory -Path $binaryLogDirectory -Force | Out-Null
+  }
+
+  $args += "/bl:`"$BinaryLogPath`""
+}
+
 Write-Host "MSBuild: $msbuildPath"
 Write-Host "Project: $projectPath"
 Write-Host "Target: $target ($Configuration|$Platform)"
+if ($PerformanceSummary) {
+  Write-Host "Performance summary: enabled"
+}
+if (-not [string]::IsNullOrWhiteSpace($BinaryLogPath)) {
+  Write-Host "Binary log: $BinaryLogPath"
+}
 
 $psi = New-SanitizedProcessStartInfo -FileName $msbuildPath -Arguments ($args -join " ") -WorkingDirectory $repoRoot
 $process = [System.Diagnostics.Process]::Start($psi)
