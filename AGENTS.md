@@ -93,6 +93,11 @@
    - Use real commit history for recent-window requests and report empty windows honestly.
    - Do not substitute file timestamps for Git-backed history requests.
 
+## ExecPlans
+
+- When writing complex features or significant refactors, use an ExecPlan from design through implementation.
+- Follow `PLANS.md` from the repository root when creating or updating that ExecPlan.
+
 ## Subagent Roles
 
 - `patchcleaner-orchestrator`: coordinates exploration, implementation, validation, critique, and final reporting.
@@ -118,6 +123,7 @@ The playbook-librarian may update only the two sections below during normal task
 - The validated local `MSBuild.exe` path is `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe`.
 - Direct `MSBuild.exe` invocation and `scripts/build-local.ps1` both succeed in this workspace as of 2026-03-25; keep the wrapper as the preferred agent entrypoint because it still normalizes `Path`/`PATH` and handles stale manifest intermediates.
 - `scripts/build-local.ps1` now probes Visual Studio 2026 Community, Professional, Enterprise, and Build Tools MSBuild paths before failing, so repo-local bootstrapper updates do not require script edits to remain usable.
+- `scripts/test-local.ps1` now runs `scripts/build-local.ps1` with MSBuild `PerformanceSummary` plus a repo-local binary log and emits `Build/validation-summary.json`, `Build/perf-build-history.json`, `Build/perf-build-timings-<config>-<platform>.json`, `Build/perf-build-trace-<config>-<platform>.json`, `Build/perf-build-flamegraph-<config>-<platform>.folded`, and `Build/perf-msbuild-<config>-<platform>.binlog` for automation-backed performance comparisons.
 - `.gitmodules` declares `third_party/wtl`, and this workspace now has live Git metadata, so recent-commit and last-N-days analysis should use real history rather than timestamps.
 - `patch_cleaner/PatchCleaner.vcxproj` currently sets `UACExecutionLevel=AsInvoker` across all configurations; preserve that unless the task explicitly changes product behavior.
 - `tools/wtl.zip` should mirror the vendored `third_party/wtl` tree when refreshed so bootstrap artifacts cannot drift behind the headers actually used by the project.
@@ -135,4 +141,5 @@ The playbook-librarian may update only the two sections below during normal task
 - 2026-03-22: Simplified Move to Temp to write directly into `C:\TempPatchCleanerFiles` and removed the unused per-run subdirectory path after validating the release build and manual user check.
 - 2026-03-23: Reduced UI repaint work by batching Select All updates, avoiding per-tick relayouts for flash-only animations, collapsing list custom draw to row-level notifications, and bounding Move to Temp collision checks with a per-operation tokenized fallback.
 - 2026-03-25: Added repo-local Windows Sandbox bundle/startup helpers and documented a release-only seeded end-to-end scenario for scan, Move to Temp, and Delete validation.
+- 2026-04-05: Expanded `scripts/test-local.ps1` and `scripts/build-local.ps1` so host validation now captures MSBuild performance summaries, binary logs, parsed timing/trace artifacts, and folded flamegraph data for daily performance-regression watches.
 - Keep this section focused on durable repo guidance, not task-by-task narrative.

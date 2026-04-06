@@ -29,3 +29,17 @@ jobs:
         with:
           name: validation-summary
           path: Build/validation-summary.json
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-perf-artifacts
+          if-no-files-found: ignore
+          path: |
+            Build/perf-build-history.json
+            Build/perf-build-output-*.log
+            Build/perf-build-timings-*.json
+            Build/perf-build-trace-*.json
+            Build/perf-build-flamegraph-*.folded
+            Build/perf-msbuild-*.binlog
