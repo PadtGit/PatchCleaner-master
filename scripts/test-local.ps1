@@ -85,6 +85,10 @@ if (Test-Path $perfHistoryPath) {
     if ($parsedHistory -is [System.Collections.IEnumerable]) {
       $history = @($parsedHistory)
     }
+    elseif ($null -ne $parsedHistory) {
+      # ConvertFrom-Json returns a single PSCustomObject when the file has one sample.
+      $history = @($parsedHistory)
+    }
   }
 }
 
