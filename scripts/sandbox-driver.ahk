@@ -116,6 +116,56 @@ ClientClick(mainHwnd, x, y) {
     }
 }
 
+ScaleForWindowDpi(mainHwnd, value) {
+    dpi := DllCall("GetDpiForWindow", "ptr", mainHwnd, "uint")
+    if !dpi {
+        dpi := 96
+    }
+    return DllCall("MulDiv", "int", value, "int", dpi, "int", 96, "int")
+}
+
+GetActionButtonCenter(mainHwnd, buttonName, &x, &y) {
+    try {
+        WinGetClientPos ,, &clientWidth, &clientHeight, "ahk_id " mainHwnd
+    } catch {
+        return false
+    }
+
+    if (clientWidth <= 0 || clientHeight <= 0) {
+        return false
+    }
+
+    outer := ScaleForWindowDpi(mainHwnd, 20)
+    actionHeight := ScaleForWindowDpi(mainHwnd, 96)
+    buttonHeight := ScaleForWindowDpi(mainHwnd, 42)
+    buttonGap := ScaleForWindowDpi(mainHwnd, 10)
+    buttonPaddingRight := ScaleForWindowDpi(mainHwnd, 24)
+    deleteWidth := ScaleForWindowDpi(mainHwnd, 114)
+    moveWidth := ScaleForWindowDpi(mainHwnd, 156)
+    selectWidth := ScaleForWindowDpi(mainHwnd, 122)
+    settingsWidth := ScaleForWindowDpi(mainHwnd, 112)
+    buttonTop := clientHeight - outer - actionHeight + actionHeight - ScaleForWindowDpi(mainHwnd, 22) - buttonHeight
+    settingsLeft := clientWidth - outer - buttonPaddingRight - settingsWidth
+    deleteLeft := settingsLeft - buttonGap - deleteWidth
+    moveLeft := deleteLeft - buttonGap - moveWidth
+    selectLeft := moveLeft - buttonGap - selectWidth
+
+    switch buttonName {
+        case "select_all":
+            left := selectLeft
+            width := selectWidth
+        case "delete":
+            left := deleteLeft
+            width := deleteWidth
+        default:
+            return false
+    }
+
+    x := left + Floor(width / 2)
+    y := buttonTop + Floor(buttonHeight / 2)
+    return true
+}
+
 SortList(mainHwnd) {
     pathClicked := ClientClick(mainHwnd, 70, 240)
     Sleep 500
@@ -125,16 +175,15 @@ SortList(mainHwnd) {
 }
 
 SelectAll(mainHwnd) {
-    try {
-        ControlFocus "SysListView321", "ahk_id " mainHwnd
-        Sleep 250
-        Send "^a"
-        SetState("select_all_sent", 1)
-        return true
-    } catch {
+    if !GetActionButtonCenter(mainHwnd, "select_all", &x, &y) {
         SetState("select_all_sent", 0)
         return false
     }
+
+    clicked := ClientClick(mainHwnd, x, y)
+    Sleep 500
+    SetState("select_all_sent", clicked ? 1 : 0)
+    return clicked
 }
 
 NudgeWindow(mainHwnd, step) {
@@ -150,9 +199,9 @@ NudgeWindow(mainHwnd, step) {
         if targetY < 0 {
             targetY := 0
         }
-        DllCall("MoveWindow", "ptr", mainHwnd, "int", targetX, "int", targetY,
-            "int", width, "int", height, "int", true)
-        return true
+        flags := 0x4000 | 0x0010 | 0x0004 | 0x0001  ; ASYNCWINDOWPOS | NOACTIVATE | NOZORDER | NOSIZE
+        return DllCall("SetWindowPos", "ptr", mainHwnd, "ptr", 0, "int", targetX,
+            "int", targetY, "int", 0, "int", 0, "uint", flags, "int") != 0
     } catch {
         return false
     }
@@ -289,7 +338,13 @@ RunDeletePhase() {
         return false
     }
 
-    deleteClicked := ClientClick(mainHwnd, 880, 618)
+    if !GetActionButtonCenter(mainHwnd, "delete", &x, &y) {
+        SetState("delete_button_clicked", 0)
+        SetState("note", "delete_button_coordinates_unavailable")
+        return false
+    }
+
+    deleteClicked := ClientClick(mainHwnd, x, y)
     SetState("delete_button_clicked", deleteClicked ? 1 : 0)
     if !deleteClicked {
         SetState("note", "delete_button_click_failed")

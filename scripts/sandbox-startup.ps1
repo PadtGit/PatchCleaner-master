@@ -30,6 +30,28 @@ $script:ChecklistPath = $null
 $script:CheckResults = @()
 $script:AutomationDriverPath = $null
 $script:AutomationRuntimePath = $null
+$script:SessionMutex = $null
+
+function Acquire-SessionMutex {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+
+  $createdNew = $false
+  try {
+    $mutex = New-Object System.Threading.Mutex($false, $Name, [ref]$createdNew)
+  } catch {
+    return $null
+  }
+
+  if (-not $mutex.WaitOne(0, $false)) {
+    $mutex.Dispose()
+    return $null
+  }
+
+  return $mutex
+}
 
 function Test-IsAdministrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -373,7 +395,7 @@ function Invoke-AutomationDriver {
     [Parameter(Mandatory = $true)]
     [string]$Phase,
 
-    [int]$TimeoutSeconds = 240
+    [int]$TimeoutSeconds = 420
   )
 
   if (-not (Test-Path $script:AutomationRuntimePath) -or -not (Test-Path $script:AutomationDriverPath)) {
@@ -557,6 +579,12 @@ try {
   $script:AutomationRuntimePath = Join-Path $BundleRoot "AutoHotkey64_UIA.exe"
 
   Set-Content -LiteralPath $script:SessionLogPath -Value @("PatchCleaner Windows Sandbox session $SessionId") -Encoding UTF8
+
+  $script:SessionMutex = Acquire-SessionMutex -Name "Local\PatchCleanerSandboxValidation"
+  if ($null -eq $script:SessionMutex) {
+    Write-SessionLog "Another PatchCleaner sandbox validation session is already running. Use the existing PatchCleaner window instead of starting a second launcher."
+    exit 0
+  }
 
   if ($SeedInitialOnly -and $SeedDeleteOnly) {
     throw "SeedInitialOnly and SeedDeleteOnly cannot be used together."
