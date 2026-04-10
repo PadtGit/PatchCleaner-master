@@ -41,7 +41,9 @@ WriteResults(status) {
     for key, value in state {
         lines.Push(key "=" value)
     }
-    FileDelete resultPath
+    if FileExist(resultPath) {
+        FileDelete resultPath
+    }
     FileAppend StrJoin(lines, "`n") "`n", resultPath, "UTF-8"
 }
 
